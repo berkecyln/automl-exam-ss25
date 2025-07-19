@@ -1,5 +1,6 @@
 *.pkl
 *.obj
+*.zip
 
 dataset_prep/
 
@@ -15,5 +16,6 @@ pipeline_demo_results/
 smac3_output/
 project_instructions.md
 pipeline_experimantel.py
+text-phase1.zip
 
 
