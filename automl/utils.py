@@ -1,5 +1,8 @@
 # src/utils.py
 import torch
+import logging
+import sys
+from pathlib import Path
 from torch.utils.data import Dataset
 
 try:
@@ -7,6 +10,45 @@ try:
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+
+
+def setup_logging(level=logging.INFO, log_file=None):
+    """Setup logging configuration.
+    
+    Args:
+        level: Logging level (default: INFO)
+        log_file: Optional log file path
+    """
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Setup root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    
+    # Remove existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler if specified
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    
+    return root_logger
 
 
 class SimpleTextDataset(Dataset):

@@ -11,3 +11,10 @@ results/
 .data/
 data/
 *logs/
+pipeline_demo_results/
+smac3_output/
+project_instructions.md
+pipeline_experimantel.py
+
+
+
