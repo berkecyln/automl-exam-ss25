@@ -8,8 +8,9 @@ from __future__ import annotations
 import logging
 import json
 import time
+import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TextIO
 from datetime import datetime
 
 
@@ -38,6 +39,7 @@ class AutoMLLogger:
         # Setup structured logging
         self.logger = logging.getLogger(f"automl.{self.experiment_name}")
         self.logger.setLevel(getattr(logging, log_level.upper()))
+        self.logger.propagate = False  # Prevent double logging
         
         # Clear existing handlers
         self.logger.handlers.clear()
@@ -61,6 +63,14 @@ class AutoMLLogger:
             )
             file_handler.setFormatter(file_format)
             self.logger.addHandler(file_handler)
+            
+            # Ensure the root logger also sends to file for comprehensive logging
+            root_logger = logging.getLogger()
+            has_file_handler = any(isinstance(h, logging.FileHandler) for h in root_logger.handlers)
+            if not has_file_handler:
+                root_file_handler = logging.FileHandler(log_file, mode='a')
+                root_file_handler.setFormatter(file_format)
+                root_logger.addHandler(root_file_handler)
         
         # Track pipeline state
         self.pipeline_state = {
@@ -233,6 +243,22 @@ class AutoMLLogger:
         if data:
             msg += f" | {self._format_dict(data)}"
         self.logger.debug(msg)
+    
+    def log_terminal_output(self, output: str, source: str = "terminal"):
+        """Log terminal output to the log file.
+        
+        Args:
+            output: The output from the terminal to log
+            source: Source of the output (e.g., 'terminal', 'stdout', 'stderr')
+        """
+        if not output.strip():
+            return
+            
+        # Add prefix to each line to identify terminal output
+        lines = output.strip().split('\n')
+        for line in lines:
+            if line.strip():
+                self.logger.info(f"📟 [{source}] {line}")
     
     def save_experiment_summary(self):
         """Save a JSON summary of the entire experiment."""

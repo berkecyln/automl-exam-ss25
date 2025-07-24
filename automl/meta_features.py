@@ -13,6 +13,9 @@ from typing import Dict, Any, Tuple
 from collections import Counter
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Import constants for feature consistency
+from .constants import FEATURE_ORDER
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
 from sklearn.pipeline import Pipeline
@@ -296,130 +299,56 @@ class MetaFeatureExtractor:
         # Return only features that exist in the meta_features dictionary
         return [feature for feature in importance_ranking if feature in meta_features]
     
-    def normalize_features(self, meta_features: Dict[str, float]) -> Dict[str, float]:
-        """Normalize meta-features to [0, 1] range for RL agent input.
+    def normalize_features(self, features: Dict[str, float]) -> Dict[str, float]:
+        """Normalize features to [0, 1] range for RL input."""
+        normalized = features.copy()
+        
+        # First, normalize accuracy
+        if 'baseline_accuracy' in normalized:
+            normalized['baseline_accuracy'] = min(normalized['baseline_accuracy'], 1.0)
+        
+        # Normalize size features by scaling
+        size_normalizers = {
+            'dataset_size': 100000,  # 100k samples
+            'avg_char_length': 1000,  # Extremely long texts
+            'max_char_length': 10000,  # Very long max length
+            'std_char_length': 1000,  # High variation
+            'avg_word_length': 20,  # Long average word length
+            'max_word_length': 50,  # Very long words
+        }
+        
+        for feature, normalizer in size_normalizers.items():
+            if feature in normalized:
+                normalized[feature] = min(normalized[feature] / normalizer, 1.0)
+                
+        return normalized
+                
+    def ensure_feature_order(self, features: Dict[str, float]) -> Dict[str, float]:
+        """Ensure the feature dictionary follows the order specified in FEATURE_ORDER.
+        
+        This is crucial to maintain consistency between meta-feature extraction and RL input.
+        """
+        ordered_features = {}
+        for feature in FEATURE_ORDER:
+            ordered_features[feature] = features.get(feature, 0.0)
+        return ordered_features
+    
+    def get_ordered_features(self, meta_features: Dict[str, float], normalize: bool = True) -> Dict[str, float]:
+        """Get features ordered according to the global FEATURE_ORDER.
         
         Args:
             meta_features: Raw meta-features dictionary
+            normalize: Whether to normalize features
             
         Returns:
-            Normalized meta-features dictionary
+            Dictionary with features in the correct order
         """
-        normalized = meta_features.copy()
-        
-        # Define normalization rules for different feature types
-        log_scale_features = [
-            'dataset_size', 'vocab_size', 'total_tokens', 
-            'max_char_length', 'max_word_length'
-        ]
-        
-        probability_features = [
-            'baseline_accuracy', 'type_token_ratio', 'hapax_legomena_ratio',
-            'top_10_word_freq_ratio'
-        ]
-        
-        # Apply log scaling to large numbers
-        for feature in log_scale_features:
-            if feature in normalized and normalized[feature] > 0:
-                normalized[feature] = np.log10(normalized[feature] + 1) / 6  # Normalize to ~[0,1]
-        
-        # Clip probability features to [0, 1]
-        for feature in probability_features:
-            if feature in normalized:
-                normalized[feature] = np.clip(normalized[feature], 0, 1)
-        
-        # Normalize length features by dividing by reasonable maximums
-        length_normalizers = {
-            'avg_char_length': 10000,
-            'median_char_length': 10000,
-            'avg_word_length': 1000,
-            'median_word_length': 1000,
-            'std_char_length': 5000,
-            'std_word_length': 500,
-            'avg_word_char_length': 20,
-        }
-        
-        for feature, normalizer in length_normalizers.items():
-            if feature in normalized:
-                normalized[feature] = min(normalized[feature] / normalizer, 1.0)
-        
-        # Normalize other features that need clamping
-        other_normalizers = {
-            'num_classes': 20,  # Assume max 20 classes
-            'class_imbalance_ratio': 100,  # Extreme imbalance ratio
-            'avg_word_freq': 1000,  # High frequency words
-            'char_vocab_size': 200,  # Extended character set
-            'avg_punctuation_per_text': 100,  # Lots of punctuation
-            'avg_digits_per_text': 100,  # Many digits
-            'avg_uppercase_per_text': 100,  # Many uppercase
-            'std_word_char_length': 10,  # High variation
-            'avg_sentences_per_text': 50,  # Many sentences
-            'std_sentences_per_text': 25,  # High sentence variation
-        }
-        
-        for feature, normalizer in other_normalizers.items():
-            if feature in normalized:
-                normalized[feature] = min(normalized[feature] / normalizer, 1.0)
-        
-        # Normalize skewness features (typically in [-3, 3] range)
-        skewness_features = ['char_length_skewness', 'word_length_skewness']
-        for feature in skewness_features:
-            if feature in normalized:
-                normalized[feature] = (normalized[feature] + 3) / 6  # Map [-3,3] to [0,1]
-                normalized[feature] = np.clip(normalized[feature], 0, 1)
-        
-        return normalized
-
-
-def extract_meta_features_from_dataset(
-    dataset_name: str,
-    data_path: Path,
-    val_size: float = 0.2,
-    random_state: int = 42
-) -> Dict[str, float]:
-    """Convenience function to extract meta-features from a specific dataset.
-    
-    Args:
-        dataset_name: Name of the dataset ('amazon', 'imdb', 'ag_news', 'dbpedia')
-        data_path: Path to the data directory
-        val_size: Validation split size
-        random_state: Random seed
-        
-    Returns:
-        Dictionary of extracted and normalized meta-features
-    """
-    from automl.datasets import (
-        AGNewsDataset, IMDBDataset, 
-        AmazonReviewsDataset, DBpediaDataset
-    )
-    
-    # Load the appropriate dataset
-    dataset_classes = {
-        'ag_news': AGNewsDataset,
-        'imdb': IMDBDataset,
-        'amazon': AmazonReviewsDataset,
-        'dbpedia': DBpediaDataset,
-    }
-    
-    if dataset_name not in dataset_classes:
-        raise ValueError(f"Unknown dataset: {dataset_name}")
-    
-    dataset = dataset_classes[dataset_name](data_path)
-    data_info = dataset.create_dataloaders(val_size=val_size, random_state=random_state)
-    
-    # Extract meta-features
-    extractor = MetaFeatureExtractor(random_state=random_state)
-    meta_features = extractor.extract_features(
-        train_df=data_info['train_df'],
-        val_df=data_info['val_df'],
-        num_classes=data_info['num_classes']
-    )
-    
-    # Normalize features for RL agent
-    normalized_features = extractor.normalize_features(meta_features)
-    
-    return {
-        'raw_features': meta_features,
-        'normalized_features': normalized_features,
-        'feature_ranking': extractor.get_feature_importance_ranking(meta_features)
-    }
+        if meta_features is None:
+            return {}
+            
+        if normalize:
+            normalized = self.normalize_features(meta_features)
+        else:
+            normalized = meta_features.copy()
+            
+        return self.ensure_feature_order(normalized)

@@ -21,6 +21,10 @@ import numpy as np
 from pathlib import Path
 from sklearn.metrics import accuracy_score, classification_report
 import yaml
+import time
+from datetime import datetime
+from automl.logging_utils import AutoMLLogger
+from automl.stream_handler import redirect_stdout_stderr
 
 from automl.core import TextAutoML
 from automl.datasets import (
@@ -290,25 +294,46 @@ if __name__ == "__main__":
 
     args.output_path = Path(args.output_path).absolute()
     args.output_path.mkdir(parents=True, exist_ok=True)
-
+    
+    # Setup enhanced logging
+    log_dir = args.output_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create our improved logger
+    logger = AutoMLLogger(
+        experiment_name=f"{args.dataset}_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        log_dir=log_dir
+    )
+    
+    # Redirect stdout and stderr to our logger
+    restore_streams = redirect_stdout_stderr(logger)
+    
+    # Also set up basic logging for backward compatibility
     logging.basicConfig(level=logging.INFO, filename=args.output_path / "run.log")
 
-    main_loop(
-        dataset=args.dataset,
-        output_path=Path(args.output_path).absolute(),
-        data_path=Path(args.data_path).absolute(),
-        seed=args.seed,
-        approach=args.approach,
-        vocab_size=args.vocab_size,
-        token_length=args.token_length,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        ffnn_hidden=args.ffnn_hidden_layer_dim,
-        lstm_emb_dim=args.lstm_emb_dim,
-        lstm_hidden_dim=args.lstm_hidden_dim,
-        data_fraction=args.data_fraction,
-        load_path=Path(args.load_path) if args.load_path is not None else None
-    )
+    try:
+        main_loop(
+            dataset=args.dataset,
+            output_path=Path(args.output_path).absolute(),
+            data_path=Path(args.data_path).absolute(),
+            seed=args.seed,
+            approach=args.approach,
+            vocab_size=args.vocab_size,
+            token_length=args.token_length,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            ffnn_hidden=args.ffnn_hidden_layer_dim,
+            lstm_emb_dim=args.lstm_emb_dim,
+            lstm_hidden_dim=args.lstm_hidden_dim,
+            data_fraction=args.data_fraction,
+            load_path=Path(args.load_path) if args.load_path is not None else None
+        )
+        
+        # Save logger summary
+        logger.save_experiment_summary()
+    finally:
+        # Restore original stdout/stderr streams
+        restore_streams()
 # end of file

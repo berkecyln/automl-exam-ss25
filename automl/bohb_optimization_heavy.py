@@ -7,6 +7,12 @@ provide feedback for model selection decisions.
 
 from __future__ import annotations
 
+_TOKENIZER_CACHE: dict[str, Any] = {}
+_MODEL_CACHE: dict[str, Any] = {}
+
+import os
+import copy
+from pathlib import Path
 
 import numpy as np
 from typing import Dict, Any, Tuple, Optional, List
@@ -19,75 +25,124 @@ from ConfigSpace.hyperparameters import (
     UniformFloatHyperparameter,
     UniformIntegerHyperparameter,
     CategoricalHyperparameter,
+    Constant,
 )
-
 from smac.scenario import Scenario
 from smac.facade.blackbox_facade import BlackBoxFacade
 from smac.intensifier.hyperband import Hyperband
+from smac.runhistory.runhistory import RunHistory
 
 # ML imports
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from setfit import SetFitModel
 
 # Local imports
 from .logging_utils import AutoMLLogger
 
+CACHE_ROOT = Path.home() / ".automl_cache"
+os.environ.setdefault("HF_HOME", str(CACHE_ROOT))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(CACHE_ROOT / "transformers"))
+os.environ.setdefault("HF_DATASETS_CACHE", str(CACHE_ROOT / "datasets"))
+os.environ.setdefault("FLAIR_CACHE_ROOT", str(CACHE_ROOT / "flair"))
+CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+def get_tokenizer(name: str):
+    if name not in _TOKENIZER_CACHE:
+        _TOKENIZER_CACHE[name] = AutoTokenizer.from_pretrained(name)
+    return _TOKENIZER_CACHE[name]
+
+def get_hf_model(name: str, num_labels: int):
+    key = f"{name}_{num_labels}"
+    if key not in _MODEL_CACHE:
+        _MODEL_CACHE[key] = AutoModelForSequenceClassification.from_pretrained(name, num_labels=num_labels)
+    # return a fresh copy so each trial starts untrained
+    return copy.deepcopy(_MODEL_CACHE[key])
+
+def get_setfit_model(name: str):
+    if name not in _MODEL_CACHE:
+        _MODEL_CACHE[name] = SetFitModel.from_pretrained(name)
+    return copy.deepcopy(_MODEL_CACHE[name])
 
 @dataclass
 class BOHBConfig:
-    """Configuration for BOHB optimization.
-    
-    Handles budget parameters for Bayesian Optimization with HyperBand.
-    
-    Parameters:
-        min_budget: Minimum fidelity (e.g., dataset percentage)
-        max_budget: Maximum fidelity (e.g., full dataset)
-        n_trials: Total configurations to evaluate (must be > max_budget)
-        wall_clock_limit: Maximum runtime in seconds
-    """
-    # Budget parameters
-    max_budget: float = 100.0
-    min_budget: float = 10.0
-    n_trials: int = 150
-    
-    # Time constraint
-    wall_clock_limit: float = 600.0  # 10 minutes default
-    
-    # SMAC parameters
-    n_workers: int = 1
-    seed: int = 42
-    deterministic: bool = True
-    num_initial_design: int = 10
-    max_ratio: float = 1.0
+    """Configuration for BOHB optimization."""
 
+    max_budget: float = 100.0  # Maximum fidelity budget
+    min_budget: float = 10.0  # Minimum fidelity budget
+    n_trials: int = 30  # Number of optimization trials (reduced from 50)
+    n_workers: int = 1  # Number of parallel workers
+    seed: int = 42  # Random seed
+    deterministic: bool = True  # Deterministic mode
+    wall_clock_limit: float = (
+        600.0  # Wall clock time limit in seconds (10 minutes default)
+    )
+    num_initial_design: int = 10  # Number of initial design configurations
+    max_ratio: float = 1.0  # Maximum ratio for initial design (1.0 = no reduction)
+    
     def __post_init__(self):
         """Validate configuration values."""
-        # Ensure parameters are positive and consistent
+        # Ensure all parameters are positive
         if self.max_budget <= 0:
             self.max_budget = 100.0
         if self.min_budget <= 0:
             self.min_budget = 10.0
-        if self.max_budget <= self.min_budget:
-            self.max_budget = self.min_budget * 3.0
-        if self.n_trials <= self.max_budget:
-            self.n_trials = int(self.max_budget * 1.5)
-        if self.wall_clock_limit <= 0:
-            self.wall_clock_limit = 600.0
-            
-    def adjust_for_model_type(self, model_type: str):
-        """Adjust config parameters for the given model type.
         
-        Args:
-            model_type: One of 'simple', 'medium', or 'complex'
-        """
-        # Adjust based on model type
-        if model_type == "medium":
-            self.wall_clock_limit *= 2.0  # Double time for medium models
-        elif model_type == "complex":
-            self.wall_clock_limit *= 3.0  # Triple time for complex models
+        # Ensure max_budget is greater than min_budget
+        if self.max_budget <= self.min_budget:
+            self.max_budget = self.min_budget * 3.0  # Make max budget 3x min budget
+            
+        if self.n_trials <= 0:
+            self.n_trials = 30
+        if self.wall_clock_limit <= 0:
+            self.wall_clock_limit = 300.0
+
+
+class TextDataset(Dataset):
+    """Simple text dataset for PyTorch models."""
+
+    def __init__(
+        self, texts: List[str], labels: List[int], tokenizer=None, max_length: int = 512
+    ):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = int(self.labels[idx])
+
+        if self.tokenizer:
+            # For transformer models (if implemented)
+            encoding = self.tokenizer(
+                text,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            return {
+                "input_ids": encoding["input_ids"].flatten(),
+                "attention_mask": encoding["attention_mask"].flatten(),
+                "labels": torch.tensor(label, dtype=torch.long),
+            }
+        else:
+            # For simple models, return text and label
+            return {"text": text, "label": label}
 
 
 class BOHBOptimizer:
@@ -110,14 +165,7 @@ class BOHBOptimizer:
         """
         self.model_type = model_type.lower()
         self.logger = logger
-        
-        # Create a config with adjusted settings for this model type
-        if config is None:
-            self.config = BOHBConfig()
-            self.config.adjust_for_model_type(model_type)
-        else:
-            self.config = config
-            
+        self.config = config or BOHBConfig()
         self.random_state = random_state
 
         # Training data placeholders
@@ -135,79 +183,39 @@ class BOHBOptimizer:
         self.evaluation_count = 0
         self.total_time = 0.0
 
-    def _calculate_budget(self, fidelity_mode: str) -> Dict[str, float]:
-        """Calculate budget parameters based on fidelity mode.
-        
-        Args:
-            fidelity_mode: "low" or "high" fidelity optimization
-            
-        Returns:
-            Dictionary with budget parameters
-        """
-        # Start with base parameters
-        min_budget = self.config.min_budget
-        
-        # Adjust max_budget based on fidelity mode
-        if fidelity_mode == "high":
-            max_budget = self.config.max_budget
-        else:
-            # For low fidelity, reduce the max budget
-            max_budget = max(min_budget * 1.5, self.config.max_budget * 0.3)
-            
-        # Adjust n_trials based on fidelity mode
-        n_trials = (
-            self.config.n_trials if fidelity_mode == "high" 
-            else min(self.config.n_trials // 2, 10)
-        )
-        
-        # Adjust time limit based on fidelity mode
-        time_limit = (
-            self.config.wall_clock_limit if fidelity_mode == "high"
-            else self.config.wall_clock_limit * 0.5
-        )
-        
-        # Ensure parameters meet SMAC requirements
-        if max_budget <= min_budget:
-            max_budget = min_budget * 3.0
-            
-        if n_trials <= max_budget:
-            n_trials = int(max_budget * 1.5)
-            
-        return {
-            "min_budget": min_budget,
-            "max_budget": max_budget,
-            "n_trials": n_trials,
-            "time_limit": time_limit
-        }
-
     def _create_config_space(self) -> ConfigurationSpace:
         """Create configuration space based on model type."""
         cs = ConfigurationSpace()
 
         if self.model_type == "simple":
-            cs.add(CategoricalHyperparameter("algorithm", ["logistic", "svm"]))
+            # TF-IDF + Classical ML configuration space
+            cs.add_hyperparameter(CategoricalHyperparameter("algorithm", ["logistic", "svm"]))
             # TF-IDF parameters
-            cs.add(UniformIntegerHyperparameter("max_features", 1000, 50000, default_value=10000))
-            cs.add(UniformFloatHyperparameter("min_df", 0.001, 0.1, default_value=0.01))
-            cs.add(UniformFloatHyperparameter("max_df", 0.7, 0.95, default_value=0.85))
-            cs.add(UniformIntegerHyperparameter("ngram_max", 1, 3, default_value=2))
-
-            cs.add(UniformFloatHyperparameter("C", 0.001, 100, log=True, default_value=1.0))
-            cs.add(UniformIntegerHyperparameter("max_iter", 100, 2000, default_value=1000))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("max_features", 1000, 50000, default_value=10000))
+            cs.add_hyperparameter(UniformFloatHyperparameter("min_df", 0.001, 0.1, default_value=0.01))
+            cs.add_hyperparameter(UniformFloatHyperparameter("max_df", 0.7, 0.95, default_value=0.85))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("ngram_max", 1, 3, default_value=2))
+            # Algorithm-specific parameters
+            cs.add_hyperparameter(UniformFloatHyperparameter("C", 0.001, 100, log=True, default_value=1.0))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("max_iter", 100, 2000, default_value=1000))
 
         elif self.model_type == "medium":
-            cs.add(CategoricalHyperparameter("algorithm", ["lsa_lr"]))
-            cs.add(UniformIntegerHyperparameter("max_features", 2000, 80000, default_value=20000))
-            cs.add(UniformIntegerHyperparameter("svd_components", 100, 1000, default_value=300))
-            cs.add(UniformFloatHyperparameter("C", 1e-3, 1e2, log=True, default_value=1.0))
-            cs.add(UniformIntegerHyperparameter("max_iter", 200, 2000, default_value=1000))
+            # Medium Model: SetFit
+            # Embedding parameters
+            cs.add_hyperparameter(CategoricalHyperparameter("algorithm", ["setFit"]))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("num_iterations", 1, 20, default_value=10))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("num_epochs", 1, 5, default_value=3))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("batch_size", 8, 64, default_value=16))
+            cs.add_hyperparameter(UniformFloatHyperparameter("lr", 1e-6, 1e-3, log=True, default_value=2e-5))
 
         elif self.model_type == "complex":
-            cs.add(CategoricalHyperparameter("algorithm", ["tfidf_mlp"]))
-            cs.add(UniformIntegerHyperparameter("max_features", 5000, 100000, default_value=30000))
-            cs.add(UniformIntegerHyperparameter("hidden_units", 50, 500, default_value=200))
-            cs.add(UniformFloatHyperparameter("alpha", 1e-6, 1e-2, log=True, default_value=1e-4))
-            cs.add(UniformIntegerHyperparameter("max_iter", 100, 500, default_value=200))
+            # Transformer configuration space
+            cs.add_hyperparameter(CategoricalHyperparameter("algorithm", ["distilBert"]))
+            cs.add_hyperparameter(UniformFloatHyperparameter("learning_rate", 1e-6, 5e-4, log=True, default_value=2e-5))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("batch_size", 8, 32, default_value=16))
+            cs.add_hyperparameter(UniformFloatHyperparameter("warmup_ratio", 0.0, 0.2, default_value=0.1))
+            cs.add_hyperparameter(UniformFloatHyperparameter("weight_decay", 0.0, 0.3, default_value=0.01))
+            cs.add_hyperparameter(UniformIntegerHyperparameter("max_length", 128, 512, default_value=256))
 
         return cs
 
@@ -225,14 +233,9 @@ class BOHBOptimizer:
         self.evaluation_count += 1
 
         # Simple timeout check - if we're past our timeout, stop the optimization
-        if (
-            hasattr(self, "optimization_timeout")
-            and time.time() > self.optimization_timeout
-        ):
+        if hasattr(self, 'optimization_timeout') and time.time() > self.optimization_timeout:
             if self.evaluation_count % 3 == 0:  # Only log occasionally to avoid spam
-                print(
-                    f"Stopping BOHB evaluation #{self.evaluation_count} due to timeout"
-                )
+                print(f"Stopping BOHB evaluation #{self.evaluation_count} due to timeout")
             return float("inf")  # Return bad score to stop optimization
 
         # Log progress every few evaluations to track progress without spam
@@ -244,7 +247,7 @@ class BOHBOptimizer:
         try:
             # Use default budget since fidelity is causing warnings
             raw_budget = getattr(self, "current_budget", None)
-
+            
             if raw_budget is None:
                 # No budget provided -> treat as full fidelity
                 n_trials = getattr(self.config, "n_trials", 20)
@@ -255,6 +258,7 @@ class BOHBOptimizer:
                 denom = max(1e-9, (max_b - min_b))
                 budget_fraction = (float(raw_budget) - min_b) / denom
                 budget_fraction = max(0.0, min(1.0, budget_fraction))  # clamp
+
 
             # Sample data based on budget
             if budget_fraction < 1.0:
@@ -267,17 +271,12 @@ class BOHBOptimizer:
 
             # Train and evaluate model
             if self.model_type == "simple":
-                score = self._evaluate_simple_model(
-                    config, X_train_sample, y_train_sample
-                )
+                score = self._evaluate_simple_model(config, X_train_sample, y_train_sample)
             elif self.model_type == "medium":
-                score = self._evaluate_medium_model(
-                    config, X_train_sample, y_train_sample
-                )
+                score = self._evaluate_medium_model(config, X_train_sample, y_train_sample)
             else:  # complex
-                score = self._evaluate_complex_model(
-                    config, X_train_sample, y_train_sample
-                )
+                epochs = max(1, int(5 * budget_fraction))
+                score = self._evaluate_complex_model(config, X_train_sample, y_train_sample, epochs)
 
             # Track evaluation time
             eval_time = time.time() - start_time
@@ -292,11 +291,7 @@ class BOHBOptimizer:
                         if hasattr(config, "__iter__")
                         else config.get_dictionary()
                     )
-                    fid = (
-                        f"budget_{raw_budget:.0f}"
-                        if raw_budget is not None
-                        else "budget_full"
-                    )
+                    fid = f"budget_{raw_budget:.0f}" if raw_budget is not None else "budget_full"
 
                     self.logger.log_bohb_iteration(
                         iteration=self.evaluation_count,
@@ -308,7 +303,7 @@ class BOHBOptimizer:
                 except Exception as logging_error:
                     # Don't let logging failures break optimization
                     self.logger.log_warning(f"BOHB logging failed: {logging_error}")
-
+                
                 bud_str = f"{raw_budget:.1f}" if raw_budget is not None else "full"
                 self.logger.log_debug(
                     f"BOHB eval #{self.evaluation_count}: "
@@ -339,7 +334,7 @@ class BOHBOptimizer:
             if self.logger:
                 self.logger.log_error(f"BOHB evaluation failed: {e}")
             print(f"BOHB evaluation error: {e}")
-            return float("inf")  # Indicate failure without fallback
+            return float('inf')  # Indicate failure without fallback
 
     def _evaluate_simple_model(
         self, config: Configuration, X_train: List[str], y_train: List[int]
@@ -387,39 +382,44 @@ class BOHBOptimizer:
         X_train: List[str],
         y_train: List[int],
     ) -> float:
-        """Evaluate medium complexity model (TruncatedSVD)"""
-        # Used model for medium complexity is TruncatedSVD
-        # TruncatedSVD Architecture:
+        """Evaluate medium complexity model (SetFit)"""
+        # Used model for medium complexity is SetFit
+        # SetFit Architecture: SentenceTransformer + linear head
         try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.decomposition import TruncatedSVD
-            from sklearn.pipeline import make_pipeline
-            from sklearn.preprocessing import Normalizer
-            from sklearn.linear_model import LogisticRegression
+            from setfit import SetFitModel, SetFitTrainer
+            from sentence_transformers.losses import CosineSimilarityLoss
+            from datasets import Dataset as HFDataset
+            import numpy as np
 
-            max_features = int(config["max_features"])
-            svd_components = int(config["svd_components"])
-            C = float(config["C"])
-            max_iter = int(config["max_iter"])
+            algorithm = config["algorithm"] # Keep for future competibility
+            num_iter = int(config["num_iterations"])
+            num_epochs = int(config["num_epochs"])
+            batch_size = int(config["batch_size"])
+            lr = float(config.get("lr", 2e-5))
 
-            vec = TfidfVectorizer(
-                max_features=max_features, stop_words="english", ngram_range=(1, 2)
+            # Build HF datasets
+            train_ds = HFDataset.from_dict({"text": X_train, "label": y_train})
+            val_ds   = HFDataset.from_dict({"text": self.X_val, "label": self.y_val})
+
+            # Load model (SetFit)
+            # NOTE: If multiple models are used, this part should be in if-else block 
+            model = get_setfit_model("sentence-transformers/all-MiniLM-L6-v2")
+
+            # Trainer - updated to use CosineSimilarityLoss from sentence_transformers
+            trainer = SetFitTrainer(
+                model=model,
+                train_dataset=train_ds,
+                eval_dataset=val_ds,
+                loss_class=CosineSimilarityLoss,  # Using from sentence_transformers now
+                num_iterations=num_iter,
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                learning_rate=lr,
             )
-            Xtr_tfidf = vec.fit_transform(X_train)
-            Xva_tfidf = vec.transform(self.X_val)
 
-            svd = TruncatedSVD(
-                n_components=svd_components, random_state=self.random_state
-            )
-            lsa = make_pipeline(svd, Normalizer(copy=False))
-
-            Xtr = lsa.fit_transform(Xtr_tfidf)
-            Xva = lsa.transform(Xva_tfidf)
-
-            clf = LogisticRegression(C=C, max_iter=max_iter, solver="lbfgs")
-            clf.fit(Xtr, y_train)
-            pred = clf.predict(Xva)
-            return accuracy_score(self.y_val, pred)
+            trainer.train()
+            metrics = trainer.evaluate() 
+            return float(metrics.get("accuracy", 0.0))
 
         except Exception as e:
             if self.logger:
@@ -427,55 +427,117 @@ class BOHBOptimizer:
             print(f"Medium model evaluation error: {e}", flush=True)
             raise
 
+
     def _evaluate_complex_model(
         self,
         config: Configuration,
         X_train: List[str],
         y_train: List[int],
+        epochs: int = 3,
     ) -> float:
-        """Evaluate complex model MLPClassifier"""
-        # Used model for complex complexity is MLPClassifier
-        # MLPClassifier Architecture: 1 hidden layer with ReLU activation
+        """Evaluate complex model DistilBERT"""
+        # UUsed model for complex complexity is DistilBERT
+        # DistilBERT Architecture: "Transformer"
         try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.neural_network import MLPClassifier
+            import numpy as np
+            from datasets import Dataset as HFDataset
+            from transformers import (
+                AutoTokenizer,
+                AutoModelForSequenceClassification,
+                TrainingArguments,
+                Trainer,
+                DataCollatorWithPadding,
+            )
+            from sklearn.metrics import accuracy_score
 
-            max_features = int(config["max_features"])
-            hidden_units = int(config["hidden_units"])
-            alpha = float(config["alpha"])
-            max_iter = int(config["max_iter"])
+            # Hyperparams
+            algorithm   = config["algorithm"] # Keep for future competibility
+            lr           = float(config["learning_rate"])
+            batch_size   = int(config["batch_size"])
+            warmup_ratio = float(config["warmup_ratio"])
+            weight_decay = float(config["weight_decay"])
+            max_length   = int(config["max_length"])
 
-            budget_fraction = getattr(self, "current_budget_fraction", 1.0)
-            max_iter_full = int(config["max_iter"])
-            hidden_full = int(config["hidden_units"])
+            # epochs passed from BOHB (budget→epochs); cap a bit
+            num_epochs = max(1, min(epochs, 3))
 
-            max_iter = max(50, int(budget_fraction * max_iter_full))
-            hidden_sz = max(50, int(budget_fraction * hidden_full))
+            # datasets
+            train_ds = HFDataset.from_dict({"text": X_train, "label": y_train})
+            val_ds   = HFDataset.from_dict({"text": self.X_val, "label": self.y_val})
 
-            vec = TfidfVectorizer(
-                max_features=max_features,
-                stop_words=None,  # include stopwords to make it "richer"
-                ngram_range=(1, 3),
-            )  # include trigrams
-            Xtr = vec.fit_transform(X_train)
-            Xva = vec.transform(self.X_val)
+            # Setup distilBert
+            # NOTE: If multiple models are used, this part should be in if-else block
+            # tokenizer & tokenization
+            tokenizer = get_tokenizer("distilbert-base-uncased")
 
-            mlp = MLPClassifier(
-                hidden_layer_sizes=(hidden_sz,),
-                activation="relu",
-                alpha=alpha,
-                max_iter=max_iter,
-                early_stopping=True,
-                validation_fraction=0.1,
-                n_iter_no_change=5,
-                tol=1e-4,
-                random_state=self.random_state,
+            def _tok(batch):
+                return tokenizer(
+                    batch["text"],
+                    truncation=True,
+                    padding="max_length",
+                    max_length=max_length,
+                )
+
+            train_ds = train_ds.map(_tok, batched=True)
+            val_ds   = val_ds.map(_tok, batched=True)
+
+            # set format for torch
+            cols = ["input_ids", "attention_mask", "label"]
+            train_ds.set_format(type="torch", columns=cols)
+            val_ds.set_format(type="torch", columns=cols)
+
+            # model
+            num_labels = len(set(y_train))
+            model = get_hf_model("distilbert-base-uncased", num_labels)
+
+            # steps for warmup
+            total_steps   = (len(train_ds) // batch_size) * num_epochs
+            warmup_steps  = int(total_steps * warmup_ratio)
+
+            # tmp output dir
+            import tempfile, os, shutil
+            out_dir = tempfile.mkdtemp()
+
+            args = TrainingArguments(
+                output_dir=out_dir,
+                per_device_train_batch_size=batch_size,
+                per_device_eval_batch_size=batch_size,
+                learning_rate=lr,
+                weight_decay=weight_decay,
+                num_train_epochs=num_epochs,
+                warmup_steps=warmup_steps,
+                logging_steps=max(1, total_steps),   
+                save_strategy="no",          
+                report_to="none",
+                disable_tqdm=True,
             )
 
-            mlp.fit(Xtr, y_train)
-            pred = mlp.predict(Xva)
-            return accuracy_score(self.y_val, pred)
+            data_collator = DataCollatorWithPadding(tokenizer)
 
+            # define metric fn manually
+            def compute_metrics(pred):
+                preds = np.argmax(pred.predictions, axis=1)
+                return {"accuracy": accuracy_score(pred.label_ids, preds)}
+
+            trainer = Trainer(
+                model=model,
+                args=args,
+                train_dataset=train_ds,
+                eval_dataset=val_ds,
+                tokenizer=tokenizer,
+                data_collator=data_collator,
+                compute_metrics=compute_metrics,
+            )
+
+            trainer.train()
+            eval_out = trainer.evaluate()
+            acc = float(eval_out.get("eval_accuracy", 0.0))
+
+            # cleanup
+            shutil.rmtree(out_dir, ignore_errors=True)
+            return acc
+
+           
         except Exception as e:
             if self.logger:
                 self.logger.log_error(f"Complex model training failed: {e}.")
@@ -524,46 +586,71 @@ class BOHBOptimizer:
             self.X_val = X_val
             self.y_val = y_val
 
-        # Calculate budget parameters based on fidelity mode
-        budget_config = self._calculate_budget(fidelity_mode)
+        # Adjust configuration based on fidelity mode and time constraints
+        if fidelity_mode == "high":
+            max_budget = self.config.max_budget
+        else:
+            # For low fidelity, reduce the max budget but ensure it's greater than min_budget
+            max_budget = max(self.config.min_budget * 1.5, self.config.max_budget * 0.3)
+        n_trials = (
+            self.config.n_trials
+            if fidelity_mode == "high"
+            else min(self.config.n_trials // 2, 10)
+        )  # Limit trials
         
-        # Extract the budget values
-        min_budget = budget_config["min_budget"]
-        max_budget = budget_config["max_budget"]
-        n_trials = budget_config["n_trials"]
-        actual_time_limit = budget_config["time_limit"]
+        # Set more generous wall clock limits based on model type and fidelity mode
+        base_wall_clock_limit = self.config.wall_clock_limit
+        model_type_multiplier = 1.0
+        if self.model_type == "medium":
+            model_type_multiplier = 2.0  # Double time for medium models
+        elif self.model_type == "complex":
+            model_type_multiplier = 3.0  # Triple time for complex models
+        
+        # Get actual time limit in seconds - much more generous
+        actual_time_limit = (
+            base_wall_clock_limit * model_type_multiplier
+            if fidelity_mode == "high"
+            else base_wall_clock_limit * 0.5  # Half time for low fidelity, but still generous
+        )
         
         # Set SMAC time limit to be slightly less than our actual limit
         smac_time_limit = actual_time_limit * 0.9  # 90% of our actual time limit
 
         # Store the timeout for our manual enforcement
         self.optimization_timeout = start_time + actual_time_limit
-
+        
         # Create configuration space
         config_space = self._create_config_space()
 
-        # Create the SMAC scenario with our calculated budget parameters
+        # Update the Scenario creation:
+        min_budget = self.config.min_budget
+        effective_max_budget = max_budget
+        
+        # Ensure effective max budget is strictly greater than min budget
+        # For low fidelity mode, don't let it go below min_budget
+        if effective_max_budget <= min_budget:
+            print(f"Warning: Adjusting max budget ({effective_max_budget}) to be greater than min budget ({min_budget})")
+            effective_max_budget = min_budget * 3.0  # Make max budget 3x min budget
+            
         scenario = Scenario(
-            configspace=config_space,
-            deterministic=self.config.deterministic,
-            n_trials=int(n_trials),  # Ensure n_trials is an integer
-            seed=self.config.seed,
-            walltime_limit=smac_time_limit,
-            min_budget=float(min_budget),
-            max_budget=float(max_budget),
+            configspace    = config_space,
+            deterministic  = self.config.deterministic,
+            n_trials       = n_trials,
+            seed           = self.config.seed,
+            walltime_limit = smac_time_limit,
+            min_budget = float(min_budget),
+            max_budget = float(effective_max_budget)
         )
 
         # Create Hyperband intensifier
         intensifier = Hyperband(
-            scenario=scenario,
-            eta=3,
-            incumbent_selection="highest_budget",  # optional but good
+            scenario         = scenario,
+            eta              = 3,
+            incumbent_selection = "highest_budget",   # optional but good
         )
-
+        
         # TODO: Check if we really need budget as input
-        def target_fn(
-            config: Configuration, seed: int | None = None, budget: float | None = None
-        ):
+        def target_fn(config: Configuration, seed: int | None = None, budget: float | None = None):                
             # Store the budget so _evaluate_config can read it
             self.current_budget = budget
             try:
@@ -573,10 +660,10 @@ class BOHBOptimizer:
 
         # BOHB‑enabled facade
         smac = BlackBoxFacade(
-            scenario=scenario,
-            target_function=target_fn,
-            intensifier=intensifier,  # Use our Hyperband intensifier
-            overwrite=True,
+            scenario         = scenario,
+            target_function  = target_fn,
+            intensifier      = intensifier,  # Use our Hyperband intensifier
+            overwrite        = True,
         )
 
         if self.logger:
@@ -592,7 +679,8 @@ class BOHBOptimizer:
         try:
             # Track the start time to calculate actual elapsed time
             optimization_start_time = time.time()
-
+            
+            
             try:
                 # Run the optimization
                 incumbent = smac.optimize()
@@ -600,15 +688,12 @@ class BOHBOptimizer:
                 print(f"BOHB optimization exception: {e}")
                 incumbent = smac.solver.incumbent if hasattr(smac, "solver") else None
 
+                
             actual_time_used = time.time() - optimization_start_time
-            print(
-                f"BOHB optimization completed in {actual_time_used:.2f}s (time limit was {actual_time_limit:.1f}s)"
-            )
+            print(f"BOHB optimization completed in {actual_time_used:.2f}s (time limit was {actual_time_limit:.1f}s)")
             if self.logger:
-                self.logger.logger.info(
-                    f"BOHB optimization completed in {actual_time_used:.2f}s (time limit was {actual_time_limit:.1f}s)"
-                )
-
+                self.logger.logger.info(f"BOHB optimization completed in {actual_time_used:.2f}s (time limit was {actual_time_limit:.1f}s)")
+                    
         except Exception as e:
             print(f"BOHB optimization error: {e}")
             if self.logger:
@@ -616,8 +701,7 @@ class BOHBOptimizer:
             # Get incumbent if available
             incumbent = (
                 smac.intensifier.get_incumbent()
-                if hasattr(smac, "intensifier")
-                and smac.intensifier.get_incumbent() is not None
+                if hasattr(smac, "intensifier") and smac.intensifier.get_incumbent() is not None
                 else None
             )
 
@@ -628,12 +712,10 @@ class BOHBOptimizer:
         if incumbent is not None:
             best_config = dict(incumbent)
             neg_cost = smac.runhistory.get_cost(incumbent)
-            best_score = -neg_cost  # back to accuracy
+            best_score = -neg_cost                          # back to accuracy
         else:
             best_config = dict(config_space.get_default_configuration())
-            best_score = max(
-                (h["score"] for h in self.optimization_history), default=0.0
-            )
+            best_score = max((h["score"] for h in self.optimization_history), default=0.0)
 
         # Update both best_score and best_config to ensure consistency
         self.best_score = best_score

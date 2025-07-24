@@ -12,7 +12,6 @@ from .datasets import (
 )
 from .meta_features import (
     MetaFeatureExtractor,
-    extract_meta_features_from_dataset,
 )
 from .logging_utils import (
     AutoMLLogger,
@@ -35,7 +34,6 @@ __all__ = [
     'AmazonReviewsDataset',
     'DBpediaDataset',
     'MetaFeatureExtractor',
-    'extract_meta_features_from_dataset',
     'AutoMLLogger',
     'create_automl_logger',
     'LoggedStage',
