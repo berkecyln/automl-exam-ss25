@@ -27,6 +27,7 @@ import pickle
 import json
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
+import torch
 
 from automl.meta_features import MetaFeatureExtractor
 from automl.rl_agent import RLModelSelector
@@ -73,6 +74,7 @@ class AutoMLPipeline:
             'performance_history': [],
             'timeline': [],
             'cv_results': {}, # New for cross-validation results
+            'detailed_logs': [],
         }
         
         # Available datasets
@@ -124,8 +126,9 @@ class AutoMLPipeline:
             self.run_leave_one_out_cv()
             
             # Step 3: Run final training on all datasets
-            #self._log_progress("STEP_3", "Starting final training on all datasets")
-            #self._run_final_training()
+            # Comment out after exam dataset obtained
+            #self._log_progress("STEP_3", "Starting final training on all datasets and selecting best model for exam dataset")
+            #exam_result = self._run_final_training(dataset="exam")
             
             
             self._log_progress("COMPLETION", "Full pipeline completed successfully")
@@ -135,15 +138,22 @@ class AutoMLPipeline:
                 "cv_folds": len(self.results['cv_results']['folds']),
                 "cv_mean_performance": self.results['cv_results']['summary'].get('mean_score', 0),
                 "cv_by_dataset": self.results['cv_results']['performance'],
+                "cv_best_configs": {
+                    f['held_out']: f['best_config']
+                    for f in self.results['cv_results']['folds']
+                }
             }
             print("\n===== LOO-CV RESULTS =====")
             print(f"Folds: {final_results['cv_folds']}")
             print(f"Mean accuracy: {final_results['cv_mean_performance']:.4f}")
             for ds, sc in final_results["cv_by_dataset"].items():
                 print(f"  {ds}: {sc:.4f}")
-            
+
+            # Comment after exam dataset obtained
             return final_results
-            
+            # Uncomment after exam dataset obtained
+            #return final_results, exam_result
+
         except Exception as e:
             self._log_progress("CRITICAL_ERROR", f"Pipeline failed: {e}")
             import traceback
@@ -308,7 +318,7 @@ class AutoMLPipeline:
                 bo = BOHBOptimizer(model_type=model_type,
                                 random_state=42,
                                 config=bohb_cfg)
-                best_cfg, acc, _ = bo.optimize(
+                best_cfg, acc, bohb_info = bo.optimize(
                     X_train=texts,
                     y_train=labels,
                     fidelity_mode="high" if iteration > 1 else "low",
@@ -319,7 +329,7 @@ class AutoMLPipeline:
                 # ---- 4. reward: -----------------------
 
                 rl_selector.env.bohb_accuracy = float(acc)
-                _, reward, done, truncated, info = rl_selector.env.step(action)
+                next_obs, reward, done, truncated, info = rl_selector.env.step(action)
                 rl_selector.env.bohb_accuracy = None
 
                 # ---- 5. store transition & learn ------------------------------
@@ -337,6 +347,30 @@ class AutoMLPipeline:
                     reset_num_timesteps=False,
                     progress_bar=False,
                 )
+                # --- DETAILED LOG ENTRY ----------------------------------------
+                obs_tensor = torch.from_numpy(obs.reshape(1, -1).astype(np.float32))
+                q_vals = rl_selector.agent.q_net(obs_tensor).detach().numpy()[0]
+
+                self.results['detailed_logs'].append({
+                    "fold": prefix or "final",
+                    "iteration": iteration,
+                    "dataset": dname,
+                    "action": action,
+                    "model_type": model_type,
+                    "q_values": q_vals.tolist(),
+                    "reward": reward,
+                    "reward_components": info["reward_components"],
+                    "bohb": {
+                        "best_score": float(acc),
+                        "best_config": best_cfg,
+                        "incumbent_history": bohb_info
+                                                .get("optimization_stats", {})
+                                                .get("convergence_history", [])[-10:],
+                        "n_trials": bohb_cfg.n_trials,
+                        "runtime_s": bohb_info.get("total_time", None),
+                        }
+                })
+
 
                 # bookkeeping ----------------------------------------------------
                 iteration_perf += acc
@@ -502,18 +536,58 @@ class AutoMLPipeline:
                 f"Mean CV performance: {self.results['cv_results']['summary']['mean_score']:.4f} "
                 f"(±{self.results['cv_results']['summary']['std_score']:.4f})"
             )
-    
-    def _run_final_training(self):
+
+    def _run_final_training(self, dataset: str = "exam") -> Dict[str, Any]:
         """Run final training on all datasets."""
-        # Prepare all training datasets
+        # Prepare all training datasets for final training
         training_datasets = self._prepare_training_datasets()
         
-        # Run RL+BOHB training
+        # Run RL+BOHB training on all datasets
         self.final_rl_selector = self._run_iterative_rl_bohb_training(
             training_datasets, 
             prefix="final"
         )
-    
+
+        final_selection: Dict[str, Any] = {}
+        # load meta‐features and data of exam data
+        meta_feats = self.results['meta_features'][dataset]
+        texts, labels = load_dataset(dataset, split='train')
+
+        # call select_model_with_bohb to get both tier and its best config
+        model_type, action, info = self.final_rl_selector.select_model_with_bohb(
+            meta_features=meta_feats,
+            training_data=(texts, labels),
+            fidelity_mode="high",
+            deterministic=True,
+            bohb_config=BOHBConfig(
+                max_budget=100.0,
+                min_budget=10.0,
+                n_trials=30,
+                wall_clock_limit=900.0
+            )
+        )
+
+        best_cfg = info.get('bohb_info', {}).get('best_config', {})
+        best_score = info.get('bohb_info', {}).get('best_score', None)
+
+        # log & store
+        self._log_progress(
+            "FINAL_SELECTION",
+            f"{dataset}: {model_type} @ acc≈{best_score:.4f}",
+            {"best_config": best_cfg}
+        )
+        final_selection[dataset] = {
+            "model_type":   model_type,
+            "best_config":  best_cfg,
+            "bohb_score":   best_score,
+            "confidence":   info.get("confidence"),
+            "q_values":     info.get("q_values"),
+        }
+
+        # save into results
+        self.results['final_selections'] = final_selection
+        return final_selection
+
     def _save_intermediate_results(self, stage: str):
         """Save intermediate results."""
         try:
@@ -557,27 +631,8 @@ def main():
         output_dir=args.output,
     )
     
-    results = pipeline.run_pipeline()
+    results, exam_results = pipeline.run_pipeline()
     
-    # Print summary results
-    """
-    print("\n======================================================================")
-    print("AUTOML PIPELINE WITH LEAVE-ONE-OUT CV COMPLETED")
-    print("======================================================================")
-    print(f"🕐 Runtime: {results['total_runtime_minutes']:.1f} minutes")
-    print(f"📁 Datasets processed: {results['datasets_processed']}")
-    print(f"🔄 Cross-validation folds: {results['cv_folds']}")
-    print()
-    print(f"📈 CROSS-VALIDATION PERFORMANCE: {results['cv_mean_performance']:.4f}")
-    print(f"📈 FINAL TRAINING PERFORMANCE: {results['final_performance']:.4f}")
-    print(f"🎯 CV vs FINAL MODEL AGREEMENT: {results['cv_vs_final_agreement']:.1%}")
-    print()
-    print("🎯 FINAL MODEL SELECTIONS:")
-    for dataset, selection in results.get('final_selections', {}).items():
-        print(f"  {dataset}: {selection.get('model_type')} (confidence: {selection.get('confidence', 0):.1f})")
-    print()
-    print(f"📂 Results saved to: {args.output}")
-    """
     print("\n======================================================================")
     print("AUTOML PIPELINE WITH LEAVE-ONE-OUT CV COMPLETED")
     print("======================================================================")
@@ -588,7 +643,20 @@ def main():
         print(f"  {ds}: {sc:.4f}")
     print(f"\n📂 Results saved to: {args.output}")
 
-
+    # Uncomment to print detailed exam dataset selection results after exam dataset obtained
+    '''
+    # Exam dataset selection results
+    print("\n===== FINAL EXAM DATASET SELECTION =====")
+    for ds, sel in exam_results.items():
+        print(f"Dataset: {ds}")
+        print(f"  • Model tier    : {sel['model_type']}")
+        print(f"  • BOHB accuracy : {sel['bohb_score']:.4f}")
+        print(f"  • Confidence    : {sel['confidence']:.4f}")
+        print(f"  • Q‑values      : {sel['q_values']}")
+        print(f"  • Best config   :")
+        for k, v in sel['best_config'].items():
+            print(f"      - {k}: {v}")
+    '''
     return 0
 
 
