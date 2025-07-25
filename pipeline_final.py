@@ -96,8 +96,9 @@ class AutoMLPipeline:
         
         progress_msg = f"[{elapsed/60:.1f}m elapsed, {remaining/60:.1f}m remaining] {stage}: {message}"
         print(progress_msg)
-        
-        self.logger.log_debug(progress_msg, data)
+        self.logger.logger.info(progress_msg)
+        if data:
+            self.logger.log_debug("extra", data)
         
         # Add to timeline
         self.results['timeline'].append({
@@ -124,8 +125,8 @@ class AutoMLPipeline:
             self.run_leave_one_out_cv()
             
             # Step 3: Run final training on all datasets
-            #self._log_progress("STEP_3", "Starting final training on all datasets")
-            #self._run_final_training()
+            self._log_progress("STEP_3", "Starting final training on all datasets")
+            self._run_final_training()
             
             
             self._log_progress("COMPLETION", "Full pipeline completed successfully")
@@ -135,13 +136,17 @@ class AutoMLPipeline:
                 "cv_folds": len(self.results['cv_results']['folds']),
                 "cv_mean_performance": self.results['cv_results']['summary'].get('mean_score', 0),
                 "cv_by_dataset": self.results['cv_results']['performance'],
+                "final_mean_performance": self.results["final_mean_performance"],
+                "cv_vs_final_agreement": self.results["cv_vs_final_agreement"],
             }
             print("\n===== LOO-CV RESULTS =====")
             print(f"Folds: {final_results['cv_folds']}")
             print(f"Mean accuracy: {final_results['cv_mean_performance']:.4f}")
             for ds, sc in final_results["cv_by_dataset"].items():
                 print(f"  {ds}: {sc:.4f}")
-            
+            print(f"Final Performance: {final_results['final_mean_performance']}")
+            print(f"Final Agreement: {final_results['cv_vs_final_agreement']:.4f}")
+
             return final_results
             
         except Exception as e:
@@ -512,6 +517,56 @@ class AutoMLPipeline:
         self.final_rl_selector = self._run_iterative_rl_bohb_training(
             training_datasets, 
             prefix="final"
+        )
+
+        final_scores, final_sel = {}, {}
+
+        # 2. For every dataset, let RL choose a model then BOHB‑tune it
+        for ds in self.datasets:
+            meta = self.results["meta_features"][ds]
+            model_type, action, info = self.final_rl_selector.select_model(meta, deterministic=True)
+
+            # High‑fidelity BOHB on the FULL dataset
+            X, y = load_dataset(ds, split="train")
+            bo = BOHBOptimizer(
+                model_type=model_type,
+                config=BOHBConfig(max_budget=100.0, min_budget=10.0, n_trials=30),
+                logger=self.logger,
+            )
+            best_cfg, best_acc, _ = bo.optimize(X, y, fidelity_mode="high")
+
+            final_scores[ds] = best_acc
+            final_sel[ds] = {
+                "model_type": model_type,
+                "action": int(action),
+                "confidence": float(info.get("confidence", 0.0)),
+                "best_config": best_cfg,
+                "accuracy": best_acc,
+            }
+
+            self._log_progress(
+                "FINAL_EVAL",
+                f"{ds}: {model_type} → {best_acc:.4f}",
+                {"config": best_cfg},
+            )
+
+        # 3. Aggregate
+        self.results["final_performance"] = final_scores
+        self.results["final_selections"] = final_sel
+        self.results["final_mean_performance"] = float(np.mean(list(final_scores.values())))
+
+        # Simple consistency metric
+        agree = [
+            1
+            for fold in self.results["cv_results"]["folds"]
+            if final_sel[fold["held_out"]]["model_type"] == fold["selected_model"]
+        ]
+        self.results["cv_vs_final_agreement"] = sum(agree) / len(self.datasets)
+
+        self._log_progress(
+            "FINAL_SUMMARY",
+            f"Mean final accuracy {self.results['final_mean_performance']:.4f} | "
+            f"agreement with CV {self.results['cv_vs_final_agreement']:.1%}",
         )
     
     def _save_intermediate_results(self, stage: str):

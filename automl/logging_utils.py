@@ -3,88 +3,148 @@
 This module provides structured logging to help understand the pipeline's
 decision-making process and track performance across different stages.
 """
+
 from __future__ import annotations
+import os
+"""Simple but effective logging system for the AutoML pipeline.
+
+Changes 2025‑07‑25
+-----------------
+* Always create ONE file handler so every message – from `AutoMLLogger`
+  *and* from any other module that uses `logging` – is persisted.
+* Attach that handler to the root logger exactly once.
+* UTF‑8 encoding for complete Unicode safety.
+"""
 
 import logging
 import json
 import time
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional, TextIO
+from typing import Dict, Any
 from datetime import datetime
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    """Write to console but substitute characters the current
+    code‑page cannot encode with '?' so we never raise."""
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except UnicodeEncodeError:
+            msg = self.format(record)
+            enc = self.stream.encoding or "utf‑8"
+            safe = msg.encode(enc, errors="replace").decode(enc)
+            self.stream.write(safe + self.terminator)
+            self.flush()
+
+
+# ───────────────────────────────────────────────────────────────
+# Helper 2: File handler that silently re‑opens if another
+#           library or child process closed the log file.
+# ───────────────────────────────────────────────────────────────
+class ResilientFileHandler(logging.FileHandler):
+    """FileHandler that reopens the log file in append mode if it's closed."""
+
+    def __init__(self, filename, mode="a", encoding="utf-8", delay=False):
+        # Force append mode to avoid log loss
+        super().__init__(filename, mode, encoding, delay)
+
+    def emit(self, record):
+        if self.stream is None or self.stream.closed:
+            self._reopen_append()
+        try:
+            super().emit(record)
+        except (ValueError, OSError):
+            # Stream invalid mid-write → reopen once, retry
+            self._reopen_append()
+            try:
+                super().emit(record)
+            except Exception:
+                pass
+
+    def _reopen_append(self):
+        """Reopen the log file in append mode to preserve previous logs."""
+        self.baseFilename = os.fspath(self.baseFilename)  # ensure str
+        self.stream = open(self.baseFilename, "a", encoding=self.encoding)
+
+
+
 class AutoMLLogger:
-    """Simple structured logger for AutoML pipeline tracking."""
-    
+    """Structured logger that writes to both terminal and a UTF-8 log file."""
+
     def __init__(
-        self, 
-        log_dir: Path = None, 
-        experiment_name: str = None,
-        log_level: str = "INFO"
+        self,
+        log_dir: Path | str | None = None,
+        experiment_name: str | None = None,
+        log_level: str = "INFO",
     ):
-        """Initialize the AutoML logger.
-        
-        Args:
-            log_dir: Directory to save log files (optional)
-            experiment_name: Name of the current experiment
-            log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        """
+        # Setup paths
         self.log_dir = Path(log_dir) if log_dir else Path("logs")
-        self.log_dir.mkdir(exist_ok=True)
-        
-        self.experiment_name = experiment_name or f"automl_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.start_time = time.time()
-        
-        # Setup structured logging
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.experiment_name = experiment_name or f"automl_{datetime.now():%Y%m%d_%H%M%S}"
+        log_file = self.log_dir / f"{self.experiment_name}.log"
+
+        # Create logger
         self.logger = logging.getLogger(f"automl.{self.experiment_name}")
-        self.logger.setLevel(getattr(logging, log_level.upper()))
-        self.logger.propagate = False  # Prevent double logging
-        
-        # Clear existing handlers
         self.logger.handlers.clear()
-        
-        # Console handler with simple format
-        console_handler = logging.StreamHandler()
-        console_format = logging.Formatter(
-            '%(asctime)s | %(levelname)-5s | %(message)s',
-            datefmt='%H:%M:%S'
+        self.logger.setLevel(logging.DEBUG)
+        self.logger.propagate = False
+
+        # Console output
+        console_handler = SafeStreamHandler(sys.stdout)
+        console_handler.setLevel(getattr(logging, log_level.upper()))
+        console_handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)-5s | %(message)s", "%H:%M:%S")
         )
-        console_handler.setFormatter(console_format)
         self.logger.addHandler(console_handler)
-        
-        # File handler with detailed format
-        if log_dir:
-            log_file = self.log_dir / f"{self.experiment_name}.log"
-            file_handler = logging.FileHandler(log_file, mode='w')
-            file_format = logging.Formatter(
-                '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-                datefmt='%Y-%m-%d %H:%M:%S'
+
+        # File handler for this logger
+        file_handler = ResilientFileHandler(log_file, mode="a", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                "%Y-%m-%d %H:%M:%S",
             )
-            file_handler.setFormatter(file_format)
-            self.logger.addHandler(file_handler)
-            
-            # Ensure the root logger also sends to file for comprehensive logging
-            root_logger = logging.getLogger()
-            has_file_handler = any(isinstance(h, logging.FileHandler) for h in root_logger.handlers)
-            if not has_file_handler:
-                root_file_handler = logging.FileHandler(log_file, mode='a')
-                root_file_handler.setFormatter(file_format)
-                root_logger.addHandler(root_file_handler)
-        
-        # Track pipeline state
-        self.pipeline_state = {
-            'experiment_name': self.experiment_name,
-            'start_time': datetime.now().isoformat(),
-            'current_stage': None,
-            'dataset_info': {},
-            'meta_features': {},
-            'rl_decisions': [],
-            'bohb_results': [],
-            'final_results': {}
+        )
+        self.logger.addHandler(file_handler)
+
+        # Add a **separate** file handler to the root logger
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+
+        already = any(
+        isinstance(h, ResilientFileHandler)
+        and getattr(h, "_automl_tag", None) == self.experiment_name
+        for h in root_logger.handlers
+        )
+        if not already:
+            root_fh = ResilientFileHandler(log_file, mode="a", encoding="utf-8")
+            root_fh.setLevel(logging.DEBUG)
+            root_fh.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+            )
+            root_fh._automl_tag = self.experiment_name  # avoid duplicates
+            root_logger.addHandler(root_fh)
+
+        # Book-keeping
+        self.start_time = time.time()
+        self.pipeline_state: Dict[str, Any] = {
+            "experiment_name": self.experiment_name,
+            "start_time": datetime.now().isoformat(),
+            "current_stage": None,
+            "dataset_info": {},
+            "meta_features": {},
+            "rl_decisions": [],
+            "bohb_results": [],
+            "final_results": {},
         }
-        
-        self.logger.info(f"🚀 AutoML Pipeline Started: {self.experiment_name}")
+
+        self.logger.info(f"🚀 AutoML run started: {self.experiment_name}")
     
     def log_stage_start(self, stage_name: str, details: Dict[str, Any] = None):
         """Log the start of a pipeline stage."""
