@@ -665,8 +665,8 @@ class AutoMLPipeline:
         model_info = self.results['final_selections'][dataset]
         model_type = model_info['model_type']
         best_config = model_info['best_config']
-        print(f"Predicting on {dataset} using {model_type} with config: {best_config}")
-        
+        self._log_progress(f"Predicting on {dataset} using {model_type} with config: {best_config}")
+        print(best_config)
         # Load train + test splits
         df_train = pd.read_csv(Path(data_path) / dataset /"train.csv")
         df_test = pd.read_csv(Path(data_path) / dataset /"test.csv")
@@ -705,16 +705,19 @@ class AutoMLPipeline:
         Xte_vec = vec.transform(Xte)
 
         if cfg["algorithm"] == "logistic":
-            clf = LogisticRegression(C=float(cfg["C"]),
-                                    max_iter=int(cfg["max_iter"]),
-                                    n_jobs=-1)
-        else:  # svm
-            clf = SVC(C=float(cfg["C"]), kernel="linear")
+            clf = LogisticRegression(
+                C=float(cfg["C"]), max_iter=int(cfg["max_iter"]), random_state=42
+            )
+        else:  # "svm"
+            clf = SVC(C=float(cfg["C"]), kernel="linear", random_state=42)
 
         clf.fit(Xtr_vec, ytr)
         return clf.predict(Xte_vec)
-    
-    
+
+
+# -----------------------------------------------------------------------------
+#  Medium tier  (TF‑IDF ➜ TruncatedSVD ➜ LogisticRegression)
+# -----------------------------------------------------------------------------
     def _predict_medium(self, cfg, Xtr, ytr, Xte):
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.decomposition import TruncatedSVD
@@ -723,27 +726,39 @@ class AutoMLPipeline:
         from sklearn.linear_model import LogisticRegression
 
         vec = TfidfVectorizer(
-            max_features=int(cfg["max_features"]), stop_words="english", ngram_range=(1, 2)
+            max_features=int(cfg["max_features"]),
+            stop_words="english",
+            ngram_range=(1, 2),
         )
         Xtr_tf = vec.fit_transform(Xtr)
         Xte_tf = vec.transform(Xte)
 
-        svd = TruncatedSVD(n_components=int(cfg["svd_components"]), random_state=42)
+        svd = TruncatedSVD(
+            n_components=int(cfg["svd_components"]), random_state=42
+        )
         lsa = make_pipeline(svd, Normalizer(copy=False))
 
         Xtr_lsa = lsa.fit_transform(Xtr_tf)
         Xte_lsa = lsa.transform(Xte_tf)
 
-        clf = LogisticRegression(C=float(cfg["C"]), max_iter=int(cfg["max_iter"]), n_jobs=-1)
+        clf = LogisticRegression(
+            C=float(cfg["C"]), max_iter=int(cfg["max_iter"]), random_state=42
+        )
         clf.fit(Xtr_lsa, ytr)
         return clf.predict(Xte_lsa)
 
+
+# -----------------------------------------------------------------------------
+#  Complex tier  (TF‑IDF ➜ 1‑hidden‑layer MLP)
+# -----------------------------------------------------------------------------
     def _predict_complex(self, cfg, Xtr, ytr, Xte):
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.neural_network import MLPClassifier
 
         vec = TfidfVectorizer(
-            max_features=int(cfg["max_features"]), ngram_range=(1, 3), stop_words=None
+            max_features=int(cfg["max_features"]),
+            ngram_range=(1, 3),
+            stop_words=None,          # include stopwords for richer vocab
         )
         Xtr_vec = vec.fit_transform(Xtr)
         Xte_vec = vec.transform(Xte)
