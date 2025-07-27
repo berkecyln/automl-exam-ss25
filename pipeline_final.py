@@ -125,7 +125,7 @@ class AutoMLPipeline:
             
             # Step 2: Run leave-one-out cross-validation
             self._log_progress("STEP_2", "Starting leave-one-out cross-validation")
-            #self.run_leave_one_out_cv()
+            self.run_leave_one_out_cv()
             
             # Step 3: Run final training on all datasets
             self._log_progress("STEP_3", "Starting final training on all datasets")
@@ -675,6 +675,7 @@ class AutoMLPipeline:
         texts_test = df_test["text"].tolist()
 
         # Test using best config
+        # THIS PART SHOULD BE CHANGED BECAUSE I WAS NOT SURE ABOUT THE MODEL STRUCTURES
         if model_type == "simple":
             preds = self._predict_simple(best_config, texts_train, labels_train, texts_test)
 
