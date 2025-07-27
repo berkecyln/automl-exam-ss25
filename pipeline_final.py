@@ -19,6 +19,7 @@ BOHB hyperparameter optimization.
 """
 
 import time
+from automl.models import LSTMClassifier, SimpleFFNN
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -124,13 +125,20 @@ class AutoMLPipeline:
             
             # Step 2: Run leave-one-out cross-validation
             self._log_progress("STEP_2", "Starting leave-one-out cross-validation")
-            self.run_leave_one_out_cv()
+            #self.run_leave_one_out_cv()
             
             # Step 3: Run final training on all datasets
             self._log_progress("STEP_3", "Starting final training on all datasets")
             self._run_final_training()
             
-            
+            # Step 4: Predict Test Labels and save results
+            predicted_labels = self._predict_on_test_split()
+            output_path = Path("data/exam_dataset")
+            output_path.mkdir(parents=True, exist_ok=True)
+
+            np.save(output_path / "predictions.npy", predicted_labels)
+            print("✅ Saved predictions to data/exam_dataset/predictions.npy")
+
             self._log_progress("COMPLETION", "Full pipeline completed successfully")
             
 
@@ -220,6 +228,63 @@ class AutoMLPipeline:
                 self._log_progress("ERROR", f"Failed to extract features from {dataset_name}: {e}")
                 continue
     
+    def _extract_meta_features_from_test(self, dataset_name: str):
+        """Extract meta-features from test dataset."""
+        extractor = MetaFeatureExtractor()
+        
+        try:
+            self._log_progress("META_FEATURES", f"Processing {dataset_name}")
+                
+            # Load full dataset - important for accurate meta-features
+            texts, labels = load_dataset(dataset_name, split='train')
+                
+            # Convert to DataFrame format expected by MetaFeatureExtractor
+            import pandas as pd
+            train_df = pd.DataFrame({
+                'text': texts,
+                'label': labels
+            })
+                
+            # Extract meta-features using the existing extractor
+            start_time = time.time()
+            raw_meta_features = extractor.extract_features(train_df)
+                
+            # Check if extraction was successful
+            if raw_meta_features is None:
+                self._log_progress("ERROR", f"Failed to extract features for {dataset_name}: raw_meta_features is None") 
+
+            # Normalize and order meta-features for the RL agent
+            meta_features = extractor.get_ordered_features(raw_meta_features)
+            extraction_time = time.time() - start_time
+                
+            # Add dataset name for reference
+            meta_features['dataset_name'] = dataset_name
+                
+            # Store dataset info
+            self.results['datasets'][dataset_name] = {
+                'num_samples': len(texts),
+                'num_classes': len(np.unique(labels)),
+                'extraction_time': extraction_time
+            }
+                
+            self.results['meta_features'][dataset_name] = meta_features
+                
+            self._log_progress(
+                "META_FEATURES", 
+                f"Extracted {len(meta_features)} features from {dataset_name}",
+                {
+                    'dataset': dataset_name,
+                    'num_features': len(meta_features),
+                    'extraction_time': extraction_time
+                }
+            )
+
+            return meta_features
+                
+        except Exception as e:
+            self._log_progress("ERROR", f"Failed to extract features from {dataset_name}: {e}")
+                        
+
     def _prepare_training_datasets(self, exclude_dataset: Optional[str] = None) -> List[Tuple]:
         """Prepare training datasets for BOHB-enhanced RL training.
         
@@ -540,7 +605,7 @@ class AutoMLPipeline:
                 f"(±{self.results['cv_results']['summary']['std_score']:.4f})"
             )
 
-    def _run_final_training(self, dataset: str = "exam") -> Dict[str, Any]:
+    def _run_final_training(self, dataset: str = "yelp") -> Dict[str, Any]:
         """Run final training on all datasets."""
         # Prepare all training datasets for final training
         training_datasets = self._prepare_training_datasets()
@@ -553,7 +618,7 @@ class AutoMLPipeline:
 
         final_selection: Dict[str, Any] = {}
         # load meta‐features and data of exam data
-        meta_feats = self.results['meta_features'][dataset]
+        meta_feats = self._extract_meta_features_from_test(dataset)
         texts, labels = load_dataset(dataset, split='train')
 
         # call select_model_with_bohb to get both tier and its best config
@@ -590,6 +655,108 @@ class AutoMLPipeline:
         # save into results
         self.results['final_selections'] = final_selection
         return final_selection
+
+    def _predict_on_test_split(self, dataset: str = "yelp", data_path: str = "data") -> np.ndarray:
+        """predict test split."""
+        if dataset not in self.results.get('final_selections', {}):
+            raise RuntimeError(f"No final selection found for dataset '{dataset}'. Did you run _run_final_training()?")
+
+        # Extract best model info
+        model_info = self.results['final_selections'][dataset]
+        model_type = model_info['model_type']
+        best_config = model_info['best_config']
+        print(f"Predicting on {dataset} using {model_type} with config: {best_config}")
+        
+        # Load train + test splits
+        df_train = pd.read_csv(Path(data_path) / dataset /"train.csv")
+        df_test = pd.read_csv(Path(data_path) / dataset /"test.csv")
+        texts_train = df_train["text"].tolist()
+        labels_train = df_train["label"].tolist()
+        texts_test = df_test["text"].tolist()
+
+        # Test using best config
+        if model_type == "simple":
+            preds = self._predict_simple(best_config, texts_train, labels_train, texts_test)
+
+        elif model_type == "medium":
+            preds = self._predict_medium(best_config, texts_train, labels_train, texts_test)
+
+        elif model_type == "complex":
+            preds = self._predict_complex(best_config, texts_train, labels_train, texts_test)
+
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        return np.asarray(preds, dtype=int)
+
+    def _predict_simple(self, cfg, Xtr, ytr, Xte):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.svm import SVC
+
+        vec = TfidfVectorizer(
+            max_features=int(cfg["max_features"]),
+            min_df=float(cfg["min_df"]),
+            max_df=float(cfg["max_df"]),
+            ngram_range=(1, int(cfg["ngram_max"])),
+            stop_words="english",
+        )
+        Xtr_vec = vec.fit_transform(Xtr)
+        Xte_vec = vec.transform(Xte)
+
+        if cfg["algorithm"] == "logistic":
+            clf = LogisticRegression(C=float(cfg["C"]),
+                                    max_iter=int(cfg["max_iter"]),
+                                    n_jobs=-1)
+        else:  # svm
+            clf = SVC(C=float(cfg["C"]), kernel="linear")
+
+        clf.fit(Xtr_vec, ytr)
+        return clf.predict(Xte_vec)
+    
+    
+    def _predict_medium(self, cfg, Xtr, ytr, Xte):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import Normalizer
+        from sklearn.linear_model import LogisticRegression
+
+        vec = TfidfVectorizer(
+            max_features=int(cfg["max_features"]), stop_words="english", ngram_range=(1, 2)
+        )
+        Xtr_tf = vec.fit_transform(Xtr)
+        Xte_tf = vec.transform(Xte)
+
+        svd = TruncatedSVD(n_components=int(cfg["svd_components"]), random_state=42)
+        lsa = make_pipeline(svd, Normalizer(copy=False))
+
+        Xtr_lsa = lsa.fit_transform(Xtr_tf)
+        Xte_lsa = lsa.transform(Xte_tf)
+
+        clf = LogisticRegression(C=float(cfg["C"]), max_iter=int(cfg["max_iter"]), n_jobs=-1)
+        clf.fit(Xtr_lsa, ytr)
+        return clf.predict(Xte_lsa)
+
+    def _predict_complex(self, cfg, Xtr, ytr, Xte):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.neural_network import MLPClassifier
+
+        vec = TfidfVectorizer(
+            max_features=int(cfg["max_features"]), ngram_range=(1, 3), stop_words=None
+        )
+        Xtr_vec = vec.fit_transform(Xtr)
+        Xte_vec = vec.transform(Xte)
+
+        mlp = MLPClassifier(
+            hidden_layer_sizes=(int(cfg["hidden_units"]),),
+            alpha=float(cfg["alpha"]),
+            max_iter=int(cfg["max_iter"]),
+            early_stopping=True,
+            random_state=42,
+        )
+        mlp.fit(Xtr_vec, ytr)
+        return mlp.predict(Xte_vec)
+
 
     def _save_intermediate_results(self, stage: str):
         """Save intermediate results."""

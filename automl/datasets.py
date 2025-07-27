@@ -151,7 +151,25 @@ class DBpediaDataset(BaseTextDataset):
 
         return train_df, test_df
 
-
+class YelpDataset(BaseTextDataset):
+    """Yelp Reviews 5-star rating dataset."""
+    
+    def get_num_classes(self) -> int:
+        return 5
+    
+    def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Load Yelp 5-star data."""
+        train_path = self.data_path / "yelp" / "train.csv"
+        test_path = self.data_path / "yelp" / "test.csv"
+        
+        if train_path.exists() and test_path.exists():
+            train_df = pd.read_csv(train_path)
+            test_df = pd.read_csv(test_path)
+        else:
+            raise FileNotFoundError(f"Data files not found at {train_path}, generating dummy data...")
+        
+        return train_df, test_df
+    
 def load_dataset(dataset_name: str, split: str = 'train', data_path: str = "data") -> Tuple[list, list]:
     """Load dataset and return texts and labels as lists.
     
@@ -170,7 +188,8 @@ def load_dataset(dataset_name: str, split: str = 'train', data_path: str = "data
         'amazon': AmazonReviewsDataset,
         'ag_news': AGNewsDataset,
         'dbpedia': DBpediaDataset,
-        'imdb': IMDBDataset
+        'imdb': IMDBDataset,
+        'yelp': YelpDataset,
     }
     
     if dataset_name not in dataset_classes:
