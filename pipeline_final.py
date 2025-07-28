@@ -147,7 +147,7 @@ class AutoMLPipeline:
                 "cv_mean_performance": self.results['cv_results']['summary'].get('mean_score', 0),
                 "cv_by_dataset": self.results['cv_results']['performance'],
                 "final_mean_performance": self.results["final_mean_performance"],
-                "cv_vs_final_agreement": self.results["cv_vs_final_agreement"],
+                #"cv_vs_final_agreement": self.results["cv_vs_final_agreement"],
                 "cv_best_configs": {
                     f['held_out']: f['best_config']
                     for f in self.results['cv_results']['folds']
@@ -159,7 +159,7 @@ class AutoMLPipeline:
             for ds, sc in final_results["cv_by_dataset"].items():
                 print(f"  {ds}: {sc:.4f}")
             print(f"Final Performance: {final_results['final_mean_performance']}")
-            print(f"Final Agreement: {final_results['cv_vs_final_agreement']:.4f}")
+            #print(f"Final Agreement: {final_results['cv_vs_final_agreement']:.4f}")
 
             return final_results
             # Uncomment after exam dataset obtained
@@ -635,6 +635,26 @@ class AutoMLPipeline:
             )
         )
 
+        # For plotting purposes for the 4th visualization function
+        inc_history = info.get("bohb_info", {}).get("incumbent_history")
+        if inc_history:
+            self.results["detailed_logs"].append({
+                "fold": "final",
+                "iteration": 0,
+                "dataset": dataset,                 # "yelp"
+                "action": action,
+                "model_type": model_type,
+                "q_values": info.get("q_values", []),
+                "reward": best_score,
+                "reward_components": {},
+                "bohb": {
+                    "best_score": best_score,
+                    "best_config": best_cfg,
+                    "incumbent_history": inc_history,
+                    "n_trials": len(inc_history),
+                    "runtime_s": info.get("bohb_info", {}).get("total_time"),
+                },
+            })
         best_cfg = info.get('bohb_info', {}).get('best_config', {})
         best_score = info.get('bohb_info', {}).get('best_score', None)
 
@@ -654,6 +674,7 @@ class AutoMLPipeline:
 
         # save into results
         self.results['final_selections'] = final_selection
+        self.results["final_mean_performance"] = best_score
         return final_selection
 
     def _predict_on_test_split(self, dataset: str = "yelp", data_path: str = "data") -> np.ndarray:
@@ -817,7 +838,7 @@ def main():
         output_dir=args.output,
     )
     
-    results, exam_results = pipeline.run_pipeline()
+    results = pipeline.run_pipeline()
     
     print("\n======================================================================")
     print("AUTOML PIPELINE WITH LEAVE-ONE-OUT CV COMPLETED")

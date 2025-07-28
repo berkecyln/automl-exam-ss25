@@ -292,20 +292,24 @@ def plot_timeline(results: Dict[str, Any], *, ax: plt.Axes | None = None, save: 
 # 8) Convenience batch saver (extended)
 # -----------------------------------------------------------------------------
 
-def save_all_figures(results: Dict[str, Any], out_dir: str | Path, feature_order: List[str] | None = None):
-    """Generate and save **all** visuals into *out_dir*."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _safe(fn, *a, **kw):
+    try:
+        fn(*a, **kw)
+    except ValueError as e:
+        print(f"[visualizer] ⚠️  {e}")
 
-    plot_rl_learning_curve(results,      save=out_dir / "rl_learning_curve.png")
-    plot_bohb_distribution(results,      save=out_dir / "bohb_scores_box.png")
-    plot_action_heatmap(results,         save=out_dir / "action_heatmap.png")
-    plot_bohb_convergence(results,       save=out_dir / "bohb_convergence_yelp.png")
-    plot_qvalue_heatmap(results,         save=out_dir / "qvalues_heatmap.png")
+def save_all_figures(results: Dict[str, Any], out_dir: str | Path,
+                     feature_order: List[str] | None = None):
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    _safe(plot_rl_learning_curve, results, save=out_dir / "rl_learning_curve.png")
+    _safe(plot_bohb_distribution, results, save=out_dir / "bohb_scores_box.png")
+    _safe(plot_action_heatmap,    results, save=out_dir / "action_heatmap.png")
+    _safe(plot_bohb_convergence,  results, save=out_dir / "bohb_convergence_yelp.png")
+    _safe(plot_qvalue_heatmap,    results, save=out_dir / "qvalues_heatmap.png")
 
     if feature_order is not None:
-        plot_meta_pca(results, feature_order, save=out_dir / "meta_pca.png")
+        _safe(plot_meta_pca, results, feature_order, save=out_dir / "meta_pca.png")
 
-    plot_timeline(results,               save=out_dir / "pipeline_timeline.png")
+    _safe(plot_timeline, results, save=out_dir / "pipeline_timeline.png")
     print(f"Figures saved to {out_dir}")
 
