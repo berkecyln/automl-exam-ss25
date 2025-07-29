@@ -1,8 +1,12 @@
 from .core import (
     TextAutoML,
-    SimpleFFNN,
-    LSTMClassifier,
-    SimpleTextDataset,
+)
+from .models import (
+    BaseTextModel,
+    SimpleModel,
+    MediumModel,
+    ComplexModel,
+    create_model,
 )
 from .datasets import (
     AGNewsDataset,
@@ -26,9 +30,11 @@ from .rl_agent import (
 
 __all__ = [
     'TextAutoML',
-    'SimpleFFNN',
-    'LSTMClassifier',
-    'SimpleTextDataset',
+    'BaseTextModel',
+    'SimpleModel',
+    'MediumModel',
+    'ComplexModel',
+    'create_model',
     'AGNewsDataset',
     'IMDBDataset', 
     'AmazonReviewsDataset',

@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
-from automl.models import SimpleFFNN, LSTMClassifier
+from automl.models import create_model, BaseTextModel
 from automl.utils import SimpleTextDataset
 from pathlib import Path
 import logging

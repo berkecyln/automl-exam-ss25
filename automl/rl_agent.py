@@ -6,6 +6,7 @@ the most appropriate model type (Simple/Medium/Complex) given dataset characteri
 """
 
 from __future__ import annotations
+from math import sqrt
 
 import numpy as np
 import gymnasium as gym
@@ -79,9 +80,9 @@ class ModelSelectionEnv(gym.Env):
 
         # Model complexity definitions using MODEL_TYPES from constants
         self.action_names = {
-            0: "Simple (TF-IDF + LR/SVM)",
-            1: "Medium (CNN/LSTM)",
-            2: "Complex (Transformer)",
+            0: "Simple",
+            1: "Medium",
+            2: "Complex",
         }
         
         # Create mapping from action index to model type
@@ -160,148 +161,67 @@ class ModelSelectionEnv(gym.Env):
             bohb_accuracy: Optional[float] = None,
         ) -> float:
         """
-        Calculate reward using ONLY the real BOHB accuracy plus your original
-        penalty terms. Heuristic accuracy estimation and blending are removed.
+        Calculate reward using BOHB accuracy and meta-features. 
 
         reward = w1 * normalized_accuracy
-                - w2 * model_complexity_penalty
-                + w3 * generalization_margin
-                - w4 * resource_usage_penalty
+            - w2 * model_complexity_penalty
+            + w3 * conf_gap 
+            + w4 * richness
 
         Requires: bohb_accuracy is not None.
         """
         if bohb_accuracy is None:
             raise ValueError("bohb_accuracy must be provided for reward calculation")
 
-        # --- Extract meta info -------------------------------------------------
-        dataset_size = meta_features[1] if len(meta_features) > 1 else 0.5
-
         # --- Original weights --------------------------------------------------
-        w1 = 0.5  # normalized_accuracy weight
-        w2 = 0.2  # model_complexity_penalty weight
-        w3 = 0.2  # generalization_margin weight
-        w4 = 0.1  # resource_usage_penalty weight
+        w1 = 0.5  # BOHB accuracy weight
+        w2 = 0.2  # model complexity penalty weight
+        w3 = 0.15  # Conditional gap weight
+        w4 = 0.15  # Feature richness weight
 
-        # 1. Normalized accuracy (real BOHB score only)
+        # 1. Normalized BOHB accuracy 
         normalized_accuracy = min(1.0, max(0.0, float(bohb_accuracy)))
 
         # 2. Model complexity penalty
         complexity_penalties = {
-            0: 0.0,  # Simple
-            1: 0.2,  # Medium
-            2: 0.4,  # Complex
+            0: 0.1,  # Simple
+            1: 0.15,  # Medium
+            2: 0.2,  # Complex
         }
         model_complexity_penalty = complexity_penalties[action]
 
-        # 3. Generalization margin (your existing helper)
-        generalization_margin = self._calculate_generalization_margin(action, meta_features)
+        # 3) baseline‐confidence gap
+        # Using default baseline in meta features we encourage the agent to
+        # chose medium or complex models if dataset has poor baseline and high variance
+        baseline = meta_features['baseline_accuracy']
+        baseline_std = meta_features['baseline_accuracy_std']
+        conf_gap = (1 - baseline) * baseline_std
+        #  we are dividing by size since we want to normalize the gap so 
+        # it scales down on large datasets (where noise averages out) 
+        # and stays meaningful on small ones (where noise really matters)
+        conf_gap = conf_gap / sqrt(meta_features['dataset_size'])
 
-        # 4. Resource usage penalty (your existing helper)
-        resource_usage_penalty = self._calculate_resource_penalty(action, dataset_size)
+        # 4) feature richness
+        # Using type-token ratio and word length standard deviation
+        # If we have high type-token ratio this means we have a lot of new words so medium or complex models might be better
+        ttr = meta_features['type_token_ratio']
+        # If we have high hapax legomena ratio this means we have a lot of rare words so medium or complex models might be better
+        hapax = meta_features['hapax_legomena_ratio']
+        alpha = 0.5  # Equal weighting
+        richness = (alpha * ttr + (1 - alpha) * hapax)
 
-        # Final reward (no blending)
+        # Final reward
         reward = (
             w1 * normalized_accuracy
             - w2 * model_complexity_penalty
-            + w3 * generalization_margin
-            - w4 * resource_usage_penalty
+            + w3 * conf_gap 
+            + w4 * richness
         )
+        print(f"Reward: {w1} * bohb accuracy({normalized_accuracy}) + {w2} * model complexity({model_complexity_penalty}) + {w3} * confidence gap({conf_gap}) + {w4} * richness({richness})")
 
         # Clamp as before
         reward = np.clip(reward, -1.0, 1.0)
         return float(reward)
-
-
-    def _estimate_model_accuracy(self, action: int, meta_features: np.ndarray) -> float:
-        """Estimate model accuracy based on type and dataset characteristics."""
-        dataset_size = meta_features[1] if len(meta_features) > 1 else 0.5
-        vocab_size = meta_features[2] if len(meta_features) > 2 else 0.5
-
-        # Base accuracy expectations for each model type
-        base_accuracies = {
-            0: 0.65,  # Simple models
-            1: 0.75,  # Medium models
-            2: 0.85,  # Complex models
-        }
-
-        base_acc = base_accuracies[action]
-
-        # Adjust based on dataset characteristics
-        # Simple models work better with small, simple datasets
-        if action == 0:
-            size_factor = 1.0 - dataset_size * 0.2  # Better with smaller datasets
-            vocab_factor = 1.0 - vocab_size * 0.1
-        # Medium models are versatile
-        elif action == 1:
-            size_factor = 0.9 + dataset_size * 0.2
-            vocab_factor = 0.9 + vocab_size * 0.2
-        # Complex models need large datasets
-        else:
-            size_factor = 0.7 + dataset_size * 0.4  # Much better with larger datasets
-            vocab_factor = 0.8 + vocab_size * 0.3
-
-        # Combine factors
-        estimated_accuracy = base_acc * size_factor * vocab_factor
-
-        # Ensure accuracy is reasonable and properly scaled
-        return np.clip(estimated_accuracy, 0.3, 0.98)
-
-    def _calculate_generalization_margin(
-        self, action: int, meta_features: np.ndarray
-    ) -> float:
-        """Calculate how well the model type generalizes for this dataset."""
-        baseline_acc = meta_features[0] if len(meta_features) > 0 else 0.5
-        dataset_size = meta_features[1] if len(meta_features) > 1 else 0.5
-        vocab_size = meta_features[2] if len(meta_features) > 2 else 0.5
-
-        # Calculate dataset complexity score
-        complexity_score = 0.4 * baseline_acc + 0.4 * dataset_size + 0.2 * vocab_size
-
-        # Define optimal ranges for each model type
-        if action == 0:  # Simple models
-            # Best for low-medium complexity (0.2-0.6)
-            optimal_range = (0.2, 0.6)
-        elif action == 1:  # Medium models
-            # Best for medium complexity (0.4-0.8)
-            optimal_range = (0.4, 0.8)
-        else:  # Complex models
-            # Best for high complexity (0.6-1.0)
-            optimal_range = (0.6, 1.0)
-
-        # Calculate distance from optimal range
-        if complexity_score < optimal_range[0]:
-            distance = optimal_range[0] - complexity_score
-        elif complexity_score > optimal_range[1]:
-            distance = complexity_score - optimal_range[1]
-        else:
-            distance = 0.0
-
-        # Convert distance to margin (higher is better)
-        generalization_margin = 1.0 - distance
-
-        return np.clip(generalization_margin, 0.0, 1.0)
-
-    def _calculate_resource_penalty(self, action: int, dataset_size: float) -> float:
-        """Calculate resource usage penalty based on model complexity and data size."""
-        # Resource usage multipliers for each model type
-        resource_multipliers = {
-            0: 1.0,  # Simple models: low resource usage
-            1: 3.0,  # Medium models: moderate resource usage
-            2: 10.0,  # Complex models: high resource usage
-        }
-
-        base_resource_cost = resource_multipliers[action]
-
-        # Larger datasets increase resource usage
-        dataset_factor = 1.0 + dataset_size * 2.0
-
-        total_resource_cost = base_resource_cost * dataset_factor
-
-        # Normalize to [0, 1] penalty (higher cost = higher penalty)
-        # Max expected cost is 10.0 * 3.0 = 30.0 for complex model + large dataset
-        resource_penalty = min(1.0, total_resource_cost / 30.0)
-
-        return resource_penalty
 
     def evaluate_with_bohb(
         self,

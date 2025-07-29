@@ -1,9 +1,8 @@
 """
-AutoML Pipeline with Leave-One-Out Cross-Validation
+AutoML Pipeline
 --------------------------------------------------
 
-This module implements an enhanced AutoML pipeline with leave-one-out cross-validation
-to evaluate transfer learning capabilities. The pipeline:
+This module implements an AutoML pipeline. The pipeline:
 
 1. Extracts meta-features from all datasets
 2. Performs leave-one-out cross-validation where:
@@ -11,40 +10,40 @@ to evaluate transfer learning capabilities. The pipeline:
    - RL+BOHB training occurs on remaining datasets
    - The trained RL agent selects a model for the held-out dataset
    - Performance is evaluated on the held-out dataset
-3. After CV, trains a final RL+BOHB model on all datasets
-4. Generates comprehensive evaluation metrics and visualizations
-
-The architecture follows the critical separation between RL model selection and
-BOHB hyperparameter optimization.
+3. After CV, trains a final RL+BOHB model on all  4 datasets
+4. Runs BOHB with result of RL agent model and hyperparameter configuration to tune more
+5. Predicts labels for the exam dataset and saves results
 """
 
 import time
-from automl.models import LSTMClassifier, SimpleFFNN
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from pathlib import Path
 import pickle
 import json
+from copy import deepcopy
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 import torch
+import argparse
 
 from automl.meta_features import MetaFeatureExtractor
 from automl.rl_agent import RLModelSelector
 from automl.datasets import load_dataset
 from automl.logging_utils import AutoMLLogger
 from automl.bohb_optimization import BOHBOptimizer, BOHBConfig
+from automl.models import create_model
 from automl.constants import META_FEATURE_DIM, FEATURE_ORDER
 
 
 class AutoMLPipeline:
-    """Enhanced AutoML Pipeline with Leave-One-Out Cross-Validation."""
-    
+    """AutoML Pipeline"""
+
     def __init__(
         self, 
         max_runtime_hours: float = 1.0, 
         output_dir: str = "automl_pipeline_results",
+        max_iterations: int = 10
     ):
         """Initialize AutoML pipeline.
         
@@ -52,12 +51,25 @@ class AutoMLPipeline:
             max_runtime_hours: Maximum runtime in hours
             output_dir: Directory for results
             datasets: List of datasets to use (default: ['amazon', 'ag_news', 'dbpedia', 'imdb'])
+            max_iterations: Maximum iterations for RL training
         """
+        # Time Limit Management
         self.max_runtime_hours = max_runtime_hours
         self.max_runtime_seconds = max_runtime_hours * 3600
         self.start_time = None
+        # Output directory
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # base BOHB configuration
+        self.bohb_base = BOHBConfig(max_budget=100, min_budget=10, n_trials=25, wall_clock_limit=720)
+        # Maximum iterations for RL training
+        self.max_iterations = max_iterations
+
+        # Available datasets
+        # (Phase 1) Training datasets
+        self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
+        # (Phase 2) Exam dataset 
+        self.exam_dataset = "yelp"
         
         # Setup logging
         self.logger = AutoMLLogger(
@@ -74,14 +86,10 @@ class AutoMLPipeline:
             'model_selections': {},
             'performance_history': [],
             'timeline': [],
-            'cv_results': {}, # New for cross-validation results
+            'cv_results': {},
             'detailed_logs': [],
         }
-        
-        # Available datasets
-        self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
-        
-    
+
     def _check_time_remaining(self) -> float:
         """Check remaining time."""
         if self.start_time is None:
@@ -113,57 +121,35 @@ class AutoMLPipeline:
         })
     
     def run_pipeline(self) -> Dict[str, Any]:
-        """Run the complete AutoML pipeline with leave-one-out cross-validation."""
+        """Run the complete AutoML pipeline."""
         self.start_time = time.time()
         
         try:
-            self._log_progress("STARTUP", "Initializing AutoML Pipeline with Leave-One-Out CV")
-            
+            self._log_progress("STARTUP", "Initializing AutoML Pipeline")
+
             # Step 1: Extract meta-features from all datasets
             self._log_progress("STEP_1", "Extracting meta-features")
-            self._extract_meta_features()
+            self._extract_meta_features(is_test=False)
             
             # Step 2: Run leave-one-out cross-validation
             self._log_progress("STEP_2", "Starting leave-one-out cross-validation")
             self.run_leave_one_out_cv()
-            
-            # Step 3: Run final training on all datasets
-            self._log_progress("STEP_3", "Starting final training on all datasets")
-            self._run_final_training()
+
+            # Step 3: Run training on all datasets
+            self._log_progress("STEP_3", "Starting training on all datasets")
+            self._run_final_training(is_test=True)
             
             # Step 4: Predict Test Labels and save results
             predicted_labels = self._predict_on_test_split()
             output_path = Path("data/exam_dataset")
             output_path.mkdir(parents=True, exist_ok=True)
 
-            np.save(output_path / "predictions.npy", predicted_labels)
-            print("✅ Saved predictions to data/exam_dataset/predictions.npy")
+            prediction_file = output_path / "predictions.npy"
+            np.save(prediction_file, predicted_labels)
+            print(f"Saved predictions to {prediction_file}")
 
             self._log_progress("COMPLETION", "Full pipeline completed successfully")
-            
 
-            final_results = {
-                "cv_folds": len(self.results['cv_results']['folds']),
-                "cv_mean_performance": self.results['cv_results']['summary'].get('mean_score', 0),
-                "cv_by_dataset": self.results['cv_results']['performance'],
-                "final_mean_performance": self.results["final_mean_performance"],
-                #"cv_vs_final_agreement": self.results["cv_vs_final_agreement"],
-                "cv_best_configs": {
-                    f['held_out']: f['best_config']
-                    for f in self.results['cv_results']['folds']
-                }
-            }
-            print("\n===== LOO-CV RESULTS =====")
-            print(f"Folds: {final_results['cv_folds']}")
-            print(f"Mean accuracy: {final_results['cv_mean_performance']:.4f}")
-            for ds, sc in final_results["cv_by_dataset"].items():
-                print(f"  {ds}: {sc:.4f}")
-            print(f"Final Performance: {final_results['final_mean_performance']}")
-            #print(f"Final Agreement: {final_results['cv_vs_final_agreement']:.4f}")
-
-            return final_results
-            # Uncomment after exam dataset obtained
-            #return final_results, exam_result
 
         except Exception as e:
             self._log_progress("CRITICAL_ERROR", f"Pipeline failed: {e}")
@@ -171,25 +157,29 @@ class AutoMLPipeline:
             self.logger.log_error(f"Pipeline error: {traceback.format_exc()}")
             return {'error': str(e)}
     
-    def _extract_meta_features(self):
-        """Extract meta-features from all datasets."""
+    def _extract_meta_features(self, is_test: bool = False):
+        """Extract meta-features from datasets."""
         extractor = MetaFeatureExtractor()
-        
-        for dataset_name in self.datasets:
+        # tune datasets array based on the test mode
+        if is_test:
+            datasets = [self.exam_dataset]
+        else:
+            datasets = self.datasets
+        # go over each dataset
+        for dataset_name in datasets:
             try:
                 self._log_progress("META_FEATURES", f"Processing {dataset_name}")
                 
-                # Load full dataset - important for accurate meta-features
+                # Load full dataset
                 texts, labels = load_dataset(dataset_name, split='train')
                 
                 # Convert to DataFrame format expected by MetaFeatureExtractor
-                import pandas as pd
                 train_df = pd.DataFrame({
                     'text': texts,
                     'label': labels
                 })
                 
-                # Extract meta-features using the existing extractor
+                # Extract meta-features
                 start_time = time.time()
                 raw_meta_features = extractor.extract_features(train_df)
                 
@@ -213,7 +203,11 @@ class AutoMLPipeline:
                 }
                 
                 self.results['meta_features'][dataset_name] = meta_features
+                # If in test mode, return the meta features for the exam dataset
+                if is_test:
+                    return meta_features
                 
+                # Log the progress except for test mode
                 self._log_progress(
                     "META_FEATURES", 
                     f"Extracted {len(meta_features)} features from {dataset_name}",
@@ -227,67 +221,10 @@ class AutoMLPipeline:
             except Exception as e:
                 self._log_progress("ERROR", f"Failed to extract features from {dataset_name}: {e}")
                 continue
-    
-    def _extract_meta_features_from_test(self, dataset_name: str):
-        """Extract meta-features from test dataset."""
-        extractor = MetaFeatureExtractor()
-        
-        try:
-            self._log_progress("META_FEATURES", f"Processing {dataset_name}")
-                
-            # Load full dataset - important for accurate meta-features
-            texts, labels = load_dataset(dataset_name, split='train')
-                
-            # Convert to DataFrame format expected by MetaFeatureExtractor
-            import pandas as pd
-            train_df = pd.DataFrame({
-                'text': texts,
-                'label': labels
-            })
-                
-            # Extract meta-features using the existing extractor
-            start_time = time.time()
-            raw_meta_features = extractor.extract_features(train_df)
-                
-            # Check if extraction was successful
-            if raw_meta_features is None:
-                self._log_progress("ERROR", f"Failed to extract features for {dataset_name}: raw_meta_features is None") 
-
-            # Normalize and order meta-features for the RL agent
-            meta_features = extractor.get_ordered_features(raw_meta_features)
-            extraction_time = time.time() - start_time
-                
-            # Add dataset name for reference
-            meta_features['dataset_name'] = dataset_name
-                
-            # Store dataset info
-            self.results['datasets'][dataset_name] = {
-                'num_samples': len(texts),
-                'num_classes': len(np.unique(labels)),
-                'extraction_time': extraction_time
-            }
-                
-            self.results['meta_features'][dataset_name] = meta_features
-                
-            self._log_progress(
-                "META_FEATURES", 
-                f"Extracted {len(meta_features)} features from {dataset_name}",
-                {
-                    'dataset': dataset_name,
-                    'num_features': len(meta_features),
-                    'extraction_time': extraction_time
-                }
-            )
-
-            return meta_features
-                
-        except Exception as e:
-            self._log_progress("ERROR", f"Failed to extract features from {dataset_name}: {e}")
-                        
 
     def _prepare_training_datasets(self, exclude_dataset: Optional[str] = None) -> List[Tuple]:
-        """Prepare training datasets for BOHB-enhanced RL training.
-        
+        """Prepare training datasets for BOHB+RL training.
+
         Args:
             exclude_dataset: Optional dataset to exclude (for cross-validation)
             
@@ -320,7 +257,47 @@ class AutoMLPipeline:
         )
         
         return training_datasets
-    
+
+    def make_bohb_profile(self, iteration: int, max_iter: int, base_cfg: BOHBConfig, model_type: str = None, is_test: bool = False) -> BOHBConfig:
+        """
+        Returns a BOHBConfig tuned for iteration.
+        
+        - "explore" for early iterations (cheap, few trials)
+        - "exploit" for later iterations (more trials, longer walltime)
+        """
+        cfg = deepcopy(base_cfg)
+
+        base_wall = base_cfg.wall_clock_limit
+
+        if is_test and model_type == "TEST":
+            cfg.n_trials = min(30, cfg.n_trials)
+            cfg.wall_clock_limit = min(600, base_wall * 3.0)
+            return cfg
+
+        if model_type == "simple":
+            base_wall = base_cfg.wall_clock_limit * 1.0
+        elif model_type == "medium":
+            base_wall = base_cfg.wall_clock_limit * 1.5
+        elif model_type == "complex":
+            base_wall = base_cfg.wall_clock_limit * 2.0
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        
+        # threshold between explore/exploit
+        explore_cutoff = max(3, int(0.3 * max_iter))
+
+        if iteration <= explore_cutoff:
+            # cheap exploration: few trials, short timeout
+            cfg.n_trials = min(8, max(5, cfg.n_trials // 4))
+            cfg.wall_clock_limit = max(120, base_wall * 0.3)
+        else:
+            # heavier exploitation
+            cfg.n_trials = min(30, cfg.n_trials)
+            cfg.wall_clock_limit = min(600, base_wall * 1.0)
+
+        
+        return cfg
+
     def _run_iterative_rl_bohb_training(
             self,
             training_datasets: List[Tuple],
@@ -331,33 +308,30 @@ class AutoMLPipeline:
         """
         log_prefix = f"{prefix}_" if prefix else ""
 
-        # 1. Initialise (no long synthetic pre‑train)
+        # Initialise RL model selector
         rl_selector = RLModelSelector(
             meta_features_dim=META_FEATURE_DIM,
             model_save_path=self.output_dir / "models" / f"{log_prefix}rl_agent",
             logger=self.logger,
             random_state=42,
         )
-        rl_selector.train(                # just enough steps to set up SB3 internals
-            total_timesteps=1,            # <- minimal “bootstrap” call
+        rl_selector.train(                
+            total_timesteps=1,            # minimal “bootstrap” call
             learning_rate=5e-4,
-            exploration_fraction=0.0,     # we’ll act deterministically
+            exploration_fraction=0.0,     # act deterministically
             target_update_interval=500,
         )
 
-        # Shared BOHB config
-        bohb_cfg = BOHBConfig(
-            max_budget=100.0,
-            min_budget=10.0,
-            n_trials=25,
-            wall_clock_limit=720.0,
-        )
+        # Max iterations for RL training
+        max_iterations = self.max_iterations
 
-        for iteration in range(1, 11):
+        for iteration in range(1, max_iterations + 1):
             if self._check_time_remaining() < 600:
                 self._log_progress(f"{log_prefix}TIME_LIMIT",
                                 "Stopping - <10 min left")
                 break
+
+            #bohb_cfg = self.make_bohb_profile(iteration, max_iterations, self.bohb_base, model_type=None, is_test=False)
 
             iteration_perf, evals = 0.0, []
             self._log_progress(f"{log_prefix}ITER", f"-> iteration {iteration}")
@@ -373,19 +347,25 @@ class AutoMLPipeline:
 
                 # ---- 2. agent picks a model (greedy) --------------------------
                 if iteration == 1 and idx == 0:
-                    # bootstrap: pick a fixed/simple or random action
-                    action = 0  # or: np.random.randint(rl_selector.env.action_space.n)
+                    # We pick simple action for first iteration
+                    # or we can pick a random action
+                    # action = np.random.randint(rl_selector.env.action_space.n)
+                    action = 0
                 else:
+                    # predict the next action after the first iteration (normal case)
                     action, _ = rl_selector.agent.predict(obs, deterministic=True)
+                
                 action = int(action)
                 model_type = rl_selector.env.action_to_model[int(action)]
                 self._log_progress(f"{log_prefix}CHOICE",
                                 f"{dname}: picked {model_type}")
 
                 # ---- 3. BOHB hyper‑parameter search ---------------------------
+                bohb_cfg = self.make_bohb_profile(iteration, max_iterations, self.bohb_base, model_type=model_type, is_test=False)
                 bo = BOHBOptimizer(model_type=model_type,
                                 random_state=42,
                                 config=bohb_cfg)
+                
                 best_cfg, acc, bohb_info = bo.optimize(
                     X_train=texts,
                     y_train=labels,
@@ -395,7 +375,8 @@ class AutoMLPipeline:
                                 f"{dname}: score {acc:.4f}")
 
                 # ---- 4. reward: -----------------------
-
+                # Send accuracy to RL environment and calculate reward
+                # See calculate_enhanced_reward in rl_agent.py for reward calculation
                 rl_selector.env.bohb_accuracy = float(acc)
                 next_obs, reward, done, truncated, info = rl_selector.env.step(action)
                 rl_selector.env.bohb_accuracy = None
@@ -415,6 +396,7 @@ class AutoMLPipeline:
                     reset_num_timesteps=False,
                     progress_bar=False,
                 )
+
                 # --- DETAILED LOG ENTRY ----------------------------------------
                 obs_tensor = torch.from_numpy(obs.reshape(1, -1).astype(np.float32))
                 q_vals = rl_selector.agent.q_net(obs_tensor).detach().numpy()[0]
@@ -439,8 +421,7 @@ class AutoMLPipeline:
                         }
                 })
 
-
-                # bookkeeping ----------------------------------------------------
+                # --- Bookkeeping ----------------------------------------------------
                 iteration_perf += acc
                 evals.append({
                     "dataset": dname,
@@ -460,7 +441,7 @@ class AutoMLPipeline:
                 })
 
 
-            # ---- iteration summary --------------------------------------------
+            # ---- Iteration summary --------------------------------------------
             mean_acc = iteration_perf / len(evals)
             self.results['rl_training_iterations'].append({
                 "iteration": iteration,
@@ -477,7 +458,9 @@ class AutoMLPipeline:
                     'timestamp': time.time(),
                     'cv_fold': prefix or 'final'
                 })
-            # simple convergence check
+            
+            # Simple convergence check
+            # TODO: TUNE THIS THRESHOLD (0.005)
             if iteration > 1 and \
             abs(self.results['rl_training_iterations'][-1]['avg_performance']
                 - self.results['rl_training_iterations'][-2]['avg_performance']) < 0.005:
@@ -533,20 +516,13 @@ class AutoMLPipeline:
                 "CV_EVALUATION", 
                 f"Selected {model_type} for held-out dataset {held_out}"
             )
-            
-            # Run BOHB on held-out dataset with selected model and our enhanced config
-            # Create a generous config for final evaluation to avoid timeout issues
-            cv_bohb_config = BOHBConfig(
-                max_budget=100.0,
-                min_budget=10.0,
-                n_trials=30,
-                wall_clock_limit=900.0  # 15 minutes per final evaluation - extremely generous
-            )
+            # Run with max budget for final evaluation for leaved out dataset
+            final_cfg = self.make_bohb_profile(self.max_iterations + 1, self.max_iterations, self.bohb_base, model_type=model_type, is_test=True)
             
             bohb_optimizer = BOHBOptimizer(
                 model_type=model_type,
                 random_state=42,
-                config=cv_bohb_config
+                config=final_cfg
             )
             
             # Sample for BOHB evaluation
@@ -605,10 +581,11 @@ class AutoMLPipeline:
                 f"(±{self.results['cv_results']['summary']['std_score']:.4f})"
             )
 
-    def _run_final_training(self, dataset: str = "yelp") -> Dict[str, Any]:
+    def _run_final_training(self, is_test: bool = True) -> Dict[str, Any]:
         """Run final training on all datasets."""
         # Prepare all training datasets for final training
         training_datasets = self._prepare_training_datasets()
+        test_dataset = self.exam_dataset
         
         # Run RL+BOHB training on all datasets
         self.final_rl_selector = self._run_iterative_rl_bohb_training(
@@ -618,30 +595,35 @@ class AutoMLPipeline:
 
         final_selection: Dict[str, Any] = {}
         # load meta‐features and data of exam data
-        meta_feats = self._extract_meta_features_from_test(dataset)
-        texts, labels = load_dataset(dataset, split='train')
+        meta_feats = self._extract_meta_features(is_test=is_test)
+        texts, labels = load_dataset(test_dataset, split='train')
 
+        # Force exploit mode for final selection
+        bohb_final_cfg = self.make_bohb_profile(
+            iteration=self.max_iterations + 1,
+            max_iter=self.max_iterations,
+            base_cfg=self.bohb_base,
+            model_type= "TEST",
+            is_test=is_test
+        )
         # call select_model_with_bohb to get both tier and its best config
         model_type, action, info = self.final_rl_selector.select_model_with_bohb(
             meta_features=meta_feats,
             training_data=(texts, labels),
             fidelity_mode="high",
             deterministic=True,
-            bohb_config=BOHBConfig(
-                max_budget=100.0,
-                min_budget=10.0,
-                n_trials=30,
-                wall_clock_limit=900.0
-            )
+            bohb_config=bohb_final_cfg
         )
 
         # For plotting purposes for the 4th visualization function
         inc_history = info.get("bohb_info", {}).get("incumbent_history")
+        best_cfg = info.get('bohb_info', {}).get('best_config', {})
+        best_score = info.get('bohb_info', {}).get('best_score', None)
         if inc_history:
             self.results["detailed_logs"].append({
                 "fold": "final",
                 "iteration": 0,
-                "dataset": dataset,                 # "yelp"
+                "dataset": test_dataset,                 # "yelp"
                 "action": action,
                 "model_type": model_type,
                 "q_values": info.get("q_values", []),
@@ -655,16 +637,14 @@ class AutoMLPipeline:
                     "runtime_s": info.get("bohb_info", {}).get("total_time"),
                 },
             })
-        best_cfg = info.get('bohb_info', {}).get('best_config', {})
-        best_score = info.get('bohb_info', {}).get('best_score', None)
 
         # log & store
         self._log_progress(
             "FINAL_SELECTION",
-            f"{dataset}: {model_type} @ acc≈{best_score:.4f}",
+            f"{test_dataset}: {model_type} @ acc≈{best_score:.4f}",
             {"best_config": best_cfg}
         )
-        final_selection[dataset] = {
+        final_selection[test_dataset] = {
             "model_type":   model_type,
             "best_config":  best_cfg,
             "bohb_score":   best_score,
@@ -695,105 +675,25 @@ class AutoMLPipeline:
         labels_train = df_train["label"].tolist()
         texts_test = df_test["text"].tolist()
 
-        # Test using best config
-        # THIS PART SHOULD BE CHANGED BECAUSE I WAS NOT SURE ABOUT THE MODEL STRUCTURES
-        if model_type == "simple":
-            preds = self._predict_simple(best_config, texts_train, labels_train, texts_test)
-
-        elif model_type == "medium":
-            preds = self._predict_medium(best_config, texts_train, labels_train, texts_test)
-
-        elif model_type == "complex":
-            preds = self._predict_complex(best_config, texts_train, labels_train, texts_test)
-
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
-        return np.asarray(preds, dtype=int)
-
-    def _predict_simple(self, cfg, Xtr, ytr, Xte):
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.svm import SVC
-
-        vec = TfidfVectorizer(
-            max_features=int(cfg["max_features"]),
-            min_df=float(cfg["min_df"]),
-            max_df=float(cfg["max_df"]),
-            ngram_range=(1, int(cfg["ngram_max"])),
-            stop_words="english",
-        )
-        Xtr_vec = vec.fit_transform(Xtr)
-        Xte_vec = vec.transform(Xte)
-
-        if cfg["algorithm"] == "logistic":
-            clf = LogisticRegression(
-                C=float(cfg["C"]), max_iter=int(cfg["max_iter"]), random_state=42
+        # Test using best config - use unified model approach
+        try:
+            # Create model using the factory function from models.py
+            model = create_model(
+                model_type=model_type,
+                config=best_config,
+                random_state=42
             )
-        else:  # "svm"
-            clf = SVC(C=float(cfg["C"]), kernel="linear", random_state=42)
-
-        clf.fit(Xtr_vec, ytr)
-        return clf.predict(Xte_vec)
-
-
-# -----------------------------------------------------------------------------
-#  Medium tier  (TF‑IDF ➜ TruncatedSVD ➜ LogisticRegression)
-# -----------------------------------------------------------------------------
-    def _predict_medium(self, cfg, Xtr, ytr, Xte):
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.decomposition import TruncatedSVD
-        from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import Normalizer
-        from sklearn.linear_model import LogisticRegression
-
-        vec = TfidfVectorizer(
-            max_features=int(cfg["max_features"]),
-            stop_words="english",
-            ngram_range=(1, 2),
-        )
-        Xtr_tf = vec.fit_transform(Xtr)
-        Xte_tf = vec.transform(Xte)
-
-        svd = TruncatedSVD(
-            n_components=int(cfg["svd_components"]), random_state=42
-        )
-        lsa = make_pipeline(svd, Normalizer(copy=False))
-
-        Xtr_lsa = lsa.fit_transform(Xtr_tf)
-        Xte_lsa = lsa.transform(Xte_tf)
-
-        clf = LogisticRegression(
-            C=float(cfg["C"]), max_iter=int(cfg["max_iter"]), random_state=42
-        )
-        clf.fit(Xtr_lsa, ytr)
-        return clf.predict(Xte_lsa)
-
-
-# -----------------------------------------------------------------------------
-#  Complex tier  (TF‑IDF ➜ 1‑hidden‑layer MLP)
-# -----------------------------------------------------------------------------
-    def _predict_complex(self, cfg, Xtr, ytr, Xte):
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.neural_network import MLPClassifier
-
-        vec = TfidfVectorizer(
-            max_features=int(cfg["max_features"]),
-            ngram_range=(1, 3),
-            stop_words=None,          # include stopwords for richer vocab
-        )
-        Xtr_vec = vec.fit_transform(Xtr)
-        Xte_vec = vec.transform(Xte)
-
-        mlp = MLPClassifier(
-            hidden_layer_sizes=(int(cfg["hidden_units"]),),
-            alpha=float(cfg["alpha"]),
-            max_iter=int(cfg["max_iter"]),
-            early_stopping=True,
-            random_state=42,
-        )
-        mlp.fit(Xtr_vec, ytr)
-        return mlp.predict(Xte_vec)
-
+            
+            # Train on full training data
+            model.fit(texts_train, labels_train)
+            
+            # Predict on test data
+            preds = model.predict(texts_test)
+            
+        except Exception as e:
+            self._log_progress("PREDICT_ERROR", f"Failed to predict with {model_type}: {e}")
+            raise
+        return np.asarray(preds, dtype=int)
 
     def _save_intermediate_results(self, stage: str):
         """Save intermediate results."""
@@ -823,47 +723,81 @@ class AutoMLPipeline:
         self._save_intermediate_results(f"cv_{held_out}")
 
 def main():
-    """Run AutoML pipeline with leave-one-out cross-validation."""
-    import argparse
+    """Run AutoML pipeline main function."""
+
     
-    parser = argparse.ArgumentParser(description="AutoML Pipeline with Leave-One-Out CV")
+    parser = argparse.ArgumentParser(description="AutoML Pipeline")
     parser.add_argument('--time', type=float, default=1.0, help="Maximum runtime in hours")
     parser.add_argument('--output', type=str, default="automl_pipeline_results", 
                         help="Output directory")
+    parser.add_argument('--max_iterations', type=int, default=10,
+                        help="Maximum iterations for RL training")
     
     args = parser.parse_args()
     
     pipeline = AutoMLPipeline(
         max_runtime_hours=args.time,
         output_dir=args.output,
+        max_iterations=args.max_iterations
     )
+
+    pipeline.run_pipeline()
+    results = pipeline.results
+
+    print("\n======================================================================")
+    print("LEAVE-ONE-OUT CV COMPLETED")
+    print("======================================================================")
+    print(f"Folds: {len(results['cv_results']['folds'])}")
+    print(f"Mean CV accuracy: {results['cv_results']['summary'].get('mean_score', 0):.4f}")
+    print("Per-dataset CV scores:")
+    for ds, sc in results['cv_results']['performance'].items():
+        print(f"  {ds}: {sc:.4f}")
+    print(f"Final model performance: {results.get('final_mean_performance', 0):.4f}")
+    print(f"\nResults saved to: {args.output}")
+    print("\n======================================================================")
+    print("FINAL TRAIN AND PREDICT COMPLETED")
+    print("======================================================================")
     
-    results = pipeline.run_pipeline()
+    # Display final model selection results
+    final_selections = results.get('final_selections', {})
+    if final_selections:
+        for dataset, selection in final_selections.items():
+            print(f"📊 Final Model Selection for {dataset.upper()}:")
+            print(f"   • Selected Model: {selection['model_type'].title()}")
+            print(f"   • BOHB Score: {selection['bohb_score']:.4f}")
+            print(f"   • Confidence: {selection.get('confidence', 0):.4f}")
+            print(f"   • Best Config: {len(selection['best_config'])} parameters")
+            
+            # Show key config parameters
+            config = selection['best_config']
+            if 'algorithm' in config:
+                print(f"     - Algorithm: {config['algorithm']}")
+            if 'max_features' in config:
+                print(f"     - Max Features: {config['max_features']}")
+            if 'C' in config:
+                print(f"     - C Parameter: {config['C']:.4f}")
+            if 'learning_rate' in config:
+                print(f"     - Learning Rate: {config['learning_rate']:.4f}")
+    
+    # Display prediction summary
+    print(f"\n🎯 Prediction Results:")
+    print(f"   • Test dataset: {pipeline.exam_dataset}")
+    print(f"   • Predictions saved to: data/exam_dataset/predictions.npy")
+    print(f"   • Total runtime: {(time.time() - pipeline.start_time)/60:.1f} minutes")
+    
+    # Display training summary
+    total_iterations = len([log for log in results['detailed_logs'] if log['fold'] == 'final'])
+    total_bohb_evals = len([eval for eval in results['bohb_evaluations'] if eval['cv_fold'] == 'final'])
+    print(f"\n📈 Training Summary:")
+    print(f"   • RL Training Iterations: {len(results.get('rl_training_iterations', []))}")
+    print(f"   • Total BOHB Evaluations: {total_bohb_evals}")
+    print(f"   • Datasets Used: {len(pipeline.datasets)}")
     
     print("\n======================================================================")
-    print("AUTOML PIPELINE WITH LEAVE-ONE-OUT CV COMPLETED")
+    print("VISUALIZATION AND ANALYSIS")
     print("======================================================================")
-    print(f"🔄 Folds: {results['cv_folds']}")
-    print(f"📈 Mean CV accuracy: {results['cv_mean_performance']:.4f}")
-    print("📊 Per-dataset CV scores:")
-    for ds, sc in results["cv_by_dataset"].items():
-        print(f"  {ds}: {sc:.4f}")
-    print(f"\n📂 Results saved to: {args.output}")
+    print("Add INFO here")
 
-    # Uncomment to print detailed exam dataset selection results after exam dataset obtained
-    '''
-    # Exam dataset selection results
-    print("\n===== FINAL EXAM DATASET SELECTION =====")
-    for ds, sel in exam_results.items():
-        print(f"Dataset: {ds}")
-        print(f"  • Model tier    : {sel['model_type']}")
-        print(f"  • BOHB accuracy : {sel['bohb_score']:.4f}")
-        print(f"  • Confidence    : {sel['confidence']:.4f}")
-        print(f"  • Q‑values      : {sel['q_values']}")
-        print(f"  • Best config   :")
-        for k, v in sel['best_config'].items():
-            print(f"      - {k}: {v}")
-    '''
     return 0
 
 

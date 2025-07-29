@@ -34,6 +34,7 @@ from sklearn.model_selection import train_test_split
 
 # Local imports
 from .logging_utils import AutoMLLogger
+from .models import create_model
 
 
 @dataclass
@@ -77,17 +78,6 @@ class BOHBConfig:
         if self.wall_clock_limit <= 0:
             self.wall_clock_limit = 600.0
             
-    def adjust_for_model_type(self, model_type: str):
-        """Adjust config parameters for the given model type.
-        
-        Args:
-            model_type: One of 'simple', 'medium', or 'complex'
-        """
-        # Adjust based on model type
-        if model_type == "medium":
-            self.wall_clock_limit *= 2.0  # Double time for medium models
-        elif model_type == "complex":
-            self.wall_clock_limit *= 3.0  # Triple time for complex models
 
 
 class BOHBOptimizer:
@@ -114,7 +104,6 @@ class BOHBOptimizer:
         # Create a config with adjusted settings for this model type
         if config is None:
             self.config = BOHBConfig()
-            self.config.adjust_for_model_type(model_type)
         else:
             self.config = config
             
@@ -265,19 +254,13 @@ class BOHBOptimizer:
                 X_train_sample = self.X_train
                 y_train_sample = self.y_train
 
-            # Train and evaluate model
+            # Train and evaluate model using unified model classes
             if self.model_type == "simple":
-                score = self._evaluate_simple_model(
-                    config, X_train_sample, y_train_sample
-                )
+                score = self._evaluate_model(config, X_train_sample, y_train_sample)
             elif self.model_type == "medium":
-                score = self._evaluate_medium_model(
-                    config, X_train_sample, y_train_sample
-                )
+                score = self._evaluate_model(config, X_train_sample, y_train_sample)
             else:  # complex
-                score = self._evaluate_complex_model(
-                    config, X_train_sample, y_train_sample
-                )
+                score = self._evaluate_model(config, X_train_sample, y_train_sample, budget_fraction)
 
             # Track evaluation time
             eval_time = time.time() - start_time
@@ -341,145 +324,38 @@ class BOHBOptimizer:
             print(f"BOHB evaluation error: {e}")
             return float("inf")  # Indicate failure without fallback
 
-    def _evaluate_simple_model(
-        self, config: Configuration, X_train: List[str], y_train: List[int]
-    ) -> float:
-        """Evaluate simple model configuration."""
-        # Extract parameters
-        algorithm = config["algorithm"]
-        max_features = config["max_features"]
-        min_df = config["min_df"]
-        max_df = config["max_df"]
-        ngram_max = config["ngram_max"]
-        C = config["C"]
-        max_iter = config["max_iter"]
-
-        # Create TF-IDF vectorizer
-        vectorizer = TfidfVectorizer(
-            max_features=max_features,
-            min_df=min_df,
-            max_df=max_df,
-            ngram_range=(1, ngram_max),
-            stop_words="english",
-        )
-
-        # Transform data
-        X_train_vec = vectorizer.fit_transform(X_train)
-        X_val_vec = vectorizer.transform(self.X_val)
-
-        # Train model
-        if algorithm == "logistic":
-            model = LogisticRegression(
-                C=C, max_iter=max_iter, random_state=self.random_state
-            )
-        elif algorithm == "svm":
-            model = SVC(C=C, kernel="linear", random_state=self.random_state)
-
-        model.fit(X_train_vec, y_train)
-
-        # Predict and evaluate
-        y_pred = model.predict(X_val_vec)
-        return accuracy_score(self.y_val, y_pred)
-
-    def _evaluate_medium_model(
-        self,
-        config: Configuration,
-        X_train: List[str],
+    def _evaluate_model(
+        self, 
+        config: Configuration, 
+        X_train: List[str], 
         y_train: List[int],
+        budget_fraction: float = 1.0
     ) -> float:
-        """Evaluate medium complexity model (TruncatedSVD)"""
-        # Used model for medium complexity is TruncatedSVD
-        # TruncatedSVD Architecture:
+        """Unified model evaluation using the model classes from models.py"""
         try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.decomposition import TruncatedSVD
-            from sklearn.pipeline import make_pipeline
-            from sklearn.preprocessing import Normalizer
-            from sklearn.linear_model import LogisticRegression
-
-            max_features = int(config["max_features"])
-            svd_components = int(config["svd_components"])
-            C = float(config["C"])
-            max_iter = int(config["max_iter"])
-
-            vec = TfidfVectorizer(
-                max_features=max_features, stop_words="english", ngram_range=(1, 2)
-            )
-            Xtr_tfidf = vec.fit_transform(X_train)
-            Xva_tfidf = vec.transform(self.X_val)
-
-            svd = TruncatedSVD(
-                n_components=svd_components, random_state=self.random_state
-            )
-            lsa = make_pipeline(svd, Normalizer(copy=False))
-
-            Xtr = lsa.fit_transform(Xtr_tfidf)
-            Xva = lsa.transform(Xva_tfidf)
-
-            clf = LogisticRegression(C=C, max_iter=max_iter, solver="lbfgs")
-            clf.fit(Xtr, y_train)
-            pred = clf.predict(Xva)
-            return accuracy_score(self.y_val, pred)
-
-        except Exception as e:
-            if self.logger:
-                self.logger.log_error(f"Medium model training failed: {e}.")
-            print(f"Medium model evaluation error: {e}", flush=True)
-            raise
-
-    def _evaluate_complex_model(
-        self,
-        config: Configuration,
-        X_train: List[str],
-        y_train: List[int],
-    ) -> float:
-        """Evaluate complex model MLPClassifier"""
-        # Used model for complex complexity is MLPClassifier
-        # MLPClassifier Architecture: 1 hidden layer with ReLU activation
-        try:
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.neural_network import MLPClassifier
-
-            max_features = int(config["max_features"])
-            hidden_units = int(config["hidden_units"])
-            alpha = float(config["alpha"])
-            max_iter = int(config["max_iter"])
-
-            budget_fraction = getattr(self, "current_budget_fraction", 1.0)
-            max_iter_full = int(config["max_iter"])
-            hidden_full = int(config["hidden_units"])
-
-            max_iter = max(50, int(budget_fraction * max_iter_full))
-            hidden_sz = max(50, int(budget_fraction * hidden_full))
-
-            vec = TfidfVectorizer(
-                max_features=max_features,
-                stop_words=None,  # include stopwords to make it "richer"
-                ngram_range=(1, 3),
-            )  # include trigrams
-            Xtr = vec.fit_transform(X_train)
-            Xva = vec.transform(self.X_val)
-
-            mlp = MLPClassifier(
-                hidden_layer_sizes=(hidden_sz,),
-                activation="relu",
-                alpha=alpha,
-                max_iter=max_iter,
-                early_stopping=True,
-                validation_fraction=0.1,
-                n_iter_no_change=5,
-                tol=1e-4,
+            # Convert configuration to dictionary
+            config_dict = dict(config)
+            
+            # Create model using the factory function
+            model = create_model(
+                model_type=self.model_type,
+                config=config_dict,
                 random_state=self.random_state,
+                budget_fraction=budget_fraction
             )
-
-            mlp.fit(Xtr, y_train)
-            pred = mlp.predict(Xva)
-            return accuracy_score(self.y_val, pred)
-
+            
+            # Train the model
+            model.fit(X_train, y_train)
+            
+            # Evaluate on validation set
+            score = model.evaluate(self.X_val, self.y_val)
+            
+            return score
+            
         except Exception as e:
             if self.logger:
-                self.logger.log_error(f"Complex model training failed: {e}.")
-            print(f"Complex model evaluation error: {e}")
+                self.logger.log_error(f"{self.model_type.title()} model evaluation failed: {e}")
+            print(f"{self.model_type.title()} model evaluation error: {e}")
             raise
 
     def optimize(
