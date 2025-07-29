@@ -222,7 +222,7 @@ class ModelSelectionEnv(gym.Env):
             + w3 * conf_gap 
             + w4 * richness
         )
-        print(f"Reward: {w1} * bohb accuracy({normalized_accuracy}) + {w2} * model complexity({model_complexity_penalty}) + {w3} * confidence gap({conf_gap}) + {w4} * richness({richness})")
+        print(f"Reward: {w1} * bohb accuracy({normalized_accuracy}) - {w2} * model complexity({model_complexity_penalty}) + {w3} * confidence gap({conf_gap}) + {w4} * richness({richness})")
 
         # Clamp as before
         reward = np.clip(reward, -1.0, 1.0)

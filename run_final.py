@@ -69,6 +69,7 @@ def run_pipeline(args):
     pipeline = AutoMLPipeline(
         max_runtime_hours=args.time,
         output_dir=output_dir,
+        num_iterations=args.max_iterations,
     )
     
     start_time = time.time()
@@ -128,6 +129,8 @@ def main():
     parser.add_argument('--datasets', type=str, nargs='+', 
                         default=['amazon', 'ag_news', 'dbpedia', 'imdb'],
                         help="Datasets to use")
+    parser.add_argument('--max_iterations', type=int, default=10,
+                        help="Number of trials for optimization")
     
     args = parser.parse_args()
     

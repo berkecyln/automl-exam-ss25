@@ -16,6 +16,8 @@ This module implements an AutoML pipeline. The pipeline:
 """
 
 import time
+import sys
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -34,6 +36,8 @@ from automl.logging_utils import AutoMLLogger
 from automl.bohb_optimization import BOHBOptimizer, BOHBConfig
 from automl.models import create_model
 from automl.constants import META_FEATURE_DIM, FEATURE_ORDER
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 class AutoMLPipeline:
@@ -724,20 +728,29 @@ class AutoMLPipeline:
 
 def main():
     """Run AutoML pipeline main function."""
-
     
     parser = argparse.ArgumentParser(description="AutoML Pipeline")
     parser.add_argument('--time', type=float, default=1.0, help="Maximum runtime in hours")
-    parser.add_argument('--output', type=str, default="automl_pipeline_results", 
-                        help="Output directory")
+    parser.add_argument('--experiment', type=str, default="default_experiment", 
+                        help="Experiment name")
     parser.add_argument('--max_iterations', type=int, default=10,
                         help="Maximum iterations for RL training")
     
     args = parser.parse_args()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Always use experiments folder as the parent directory
+    experiments_dir = Path("experiments")
+    experiments_dir.mkdir(exist_ok=True)
+    
+    # Create output directory inside experiments folder
+    output_dir = experiments_dir / args.experiment / f"run_{timestamp}"
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
     
     pipeline = AutoMLPipeline(
         max_runtime_hours=args.time,
-        output_dir=args.output,
+        output_dir=output_dir,
         max_iterations=args.max_iterations
     )
 
