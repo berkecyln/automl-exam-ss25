@@ -6,6 +6,7 @@ the most appropriate model type (Simple/Medium/Complex) given dataset characteri
 """
 
 from __future__ import annotations
+from curses import meta
 from math import sqrt
 
 import numpy as np
@@ -172,6 +173,10 @@ class ModelSelectionEnv(gym.Env):
         """
         if bohb_accuracy is None:
             raise ValueError("bohb_accuracy must be provided for reward calculation")
+        if isinstance(meta_features, np.ndarray):
+            mf = { name: float(val) for name, val in zip(FEATURE_ORDER, meta_features) }
+        else:
+            mf = meta_features
 
         # --- Original weights --------------------------------------------------
         w1 = 0.5  # BOHB accuracy weight
@@ -193,20 +198,20 @@ class ModelSelectionEnv(gym.Env):
         # 3) baseline‐confidence gap
         # Using default baseline in meta features we encourage the agent to
         # chose medium or complex models if dataset has poor baseline and high variance
-        baseline = meta_features['baseline_accuracy']
-        baseline_std = meta_features['baseline_accuracy_std']
+        baseline = mf['baseline_accuracy']
+        baseline_std = mf['baseline_accuracy_std']
         conf_gap = (1 - baseline) * baseline_std
         #  we are dividing by size since we want to normalize the gap so 
         # it scales down on large datasets (where noise averages out) 
         # and stays meaningful on small ones (where noise really matters)
-        conf_gap = conf_gap / sqrt(meta_features['dataset_size'])
+        conf_gap = conf_gap / sqrt(mf['dataset_size'])
 
         # 4) feature richness
         # Using type-token ratio and word length standard deviation
         # If we have high type-token ratio this means we have a lot of new words so medium or complex models might be better
-        ttr = meta_features['type_token_ratio']
+        ttr = mf['type_token_ratio']
         # If we have high hapax legomena ratio this means we have a lot of rare words so medium or complex models might be better
-        hapax = meta_features['hapax_legomena_ratio']
+        hapax = mf['hapax_legomena_ratio']
         alpha = 0.5  # Equal weighting
         richness = (alpha * ttr + (1 - alpha) * hapax)
 
