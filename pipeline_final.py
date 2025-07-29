@@ -686,7 +686,7 @@ class AutoMLPipeline:
         model_info = self.results['final_selections'][dataset]
         model_type = model_info['model_type']
         best_config = model_info['best_config']
-        self._log_progress(f"Predicting on {dataset} using {model_type} with config: {best_config}")
+        self._log_progress("PREDICT:", f"Predicting on {dataset} using {model_type} with config: {best_config}")
         print(best_config)
         # Load train + test splits
         df_train = pd.read_csv(Path(data_path) / dataset /"train.csv")
