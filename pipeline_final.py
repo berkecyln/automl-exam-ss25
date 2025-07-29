@@ -79,7 +79,7 @@ class AutoMLPipeline:
         }
         
         # Available datasets
-        self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
+        self.datasets = ['amazon', 'ag_news']
         
     
     def _check_time_remaining(self) -> float:
@@ -183,7 +183,6 @@ class AutoMLPipeline:
                 texts, labels = load_dataset(dataset_name, split='train')
                 
                 # Convert to DataFrame format expected by MetaFeatureExtractor
-                import pandas as pd
                 train_df = pd.DataFrame({
                     'text': texts,
                     'label': labels
@@ -239,7 +238,6 @@ class AutoMLPipeline:
             texts, labels = load_dataset(dataset_name, split='train')
                 
             # Convert to DataFrame format expected by MetaFeatureExtractor
-            import pandas as pd
             train_df = pd.DataFrame({
                 'text': texts,
                 'label': labels
@@ -327,21 +325,22 @@ class AutoMLPipeline:
             prefix: str = ""
         ) -> RLModelSelector:
         """
-        RL + BOHB training that learns only from real-data experience.
+        RL + BOHB training with enhanced reward calculation and context tracking.
         """
         log_prefix = f"{prefix}_" if prefix else ""
+        start_time = time.time()
 
-        # 1. Initialise (no long synthetic pre‑train)
+        # 1. Initialize RL selector
         rl_selector = RLModelSelector(
             meta_features_dim=META_FEATURE_DIM,
             model_save_path=self.output_dir / "models" / f"{log_prefix}rl_agent",
             logger=self.logger,
             random_state=42,
         )
-        rl_selector.train(                # just enough steps to set up SB3 internals
-            total_timesteps=1,            # <- minimal “bootstrap” call
+        rl_selector.train(
+            total_timesteps=1,
             learning_rate=5e-4,
-            exploration_fraction=0.0,     # we’ll act deterministically
+            exploration_fraction=0.0,
             target_update_interval=500,
         )
 
@@ -355,16 +354,20 @@ class AutoMLPipeline:
 
         for iteration in range(1, 11):
             if self._check_time_remaining() < 600:
-                self._log_progress(f"{log_prefix}TIME_LIMIT",
-                                "Stopping - <10 min left")
+                self._log_progress(f"{log_prefix}TIME_LIMIT", "Stopping - <10 min left")
                 break
 
             iteration_perf, evals = 0.0, []
             self._log_progress(f"{log_prefix}ITER", f"-> iteration {iteration}")
 
+            # Calculate remaining budget
+            elapsed_time = time.time() - start_time
+            remaining_budget = max(0.0, 1.0 - elapsed_time / self.max_runtime_seconds)
+
             # ---- iterate over real datasets -----------------------------------
             for idx, (texts, labels, mfeat) in enumerate(training_datasets):
                 dname = mfeat.get("dataset_name", "unknown")
+                eval_start_time = time.time()
 
                 # ---- 1. env.reset with real meta‑features ---------------------
                 obs, _ = rl_selector.env.reset(
@@ -373,51 +376,75 @@ class AutoMLPipeline:
 
                 # ---- 2. agent picks a model (greedy) --------------------------
                 if iteration == 1 and idx == 0:
-                    # bootstrap: pick a fixed/simple or random action
-                    action = 0  # or: np.random.randint(rl_selector.env.action_space.n)
+                    action = 0
                 else:
                     action, _ = rl_selector.agent.predict(obs, deterministic=True)
                 action = int(action)
                 model_type = rl_selector.env.action_to_model[int(action)]
-                self._log_progress(f"{log_prefix}CHOICE",
-                                f"{dname}: picked {model_type}")
+                self._log_progress(f"{log_prefix}CHOICE", f"{dname}: picked {model_type}")
 
                 # ---- 3. BOHB hyper‑parameter search ---------------------------
-                bo = BOHBOptimizer(model_type=model_type,
-                                random_state=42,
-                                config=bohb_cfg)
+                bo = BOHBOptimizer(model_type=model_type, random_state=42, config=bohb_cfg)
+                
                 best_cfg, acc, bohb_info = bo.optimize(
                     X_train=texts,
                     y_train=labels,
                     fidelity_mode="high" if iteration > 1 else "low",
                 )
-                self._log_progress(f"{log_prefix}BOHB",
-                                f"{dname}: score {acc:.4f}")
+                self._log_progress(f"{log_prefix}BOHB", f"{dname}: score {acc:.4f}")
 
-                # ---- 4. reward: -----------------------
+                eval_time = time.time() - eval_start_time
 
+                # ---- 4. Enhanced reward calculation with context ---------------
+                # Set the BOHB accuracy in environment
                 rl_selector.env.bohb_accuracy = float(acc)
+                
+                # Calculate enhanced reward with additional context
+                enhanced_reward = rl_selector.env.reward_calculator.calculate_enhanced_reward(
+                    action=action,
+                    meta_features=rl_selector._prepare_observation(mfeat),
+                    bohb_accuracy=float(acc),
+                    time_taken=eval_time,
+                    iteration=iteration,
+                    remaining_budget=remaining_budget
+                )
+                
+                # Step the environment (this will use the enhanced reward)
                 next_obs, reward, done, truncated, info = rl_selector.env.step(action)
+                
+                # Clear the BOHB accuracy
                 rl_selector.env.bohb_accuracy = None
 
                 # ---- 5. store transition & learn ------------------------------
                 rl_selector.agent.replay_buffer.add(
-                    obs,                      # s
-                    obs,                      # s' (single‑step episode)
+                    obs,
+                    obs,
                     np.array([action]),
                     np.array([reward]),
-                    np.array([True]),         # done
+                    np.array([True]),
                     [{}],
                 )
-                # short online update
+                
+                # Short online update
                 rl_selector.agent.learn(
                     total_timesteps=256,
                     reset_num_timesteps=False,
                     progress_bar=False,
                 )
-                # --- DETAILED LOG ENTRY ----------------------------------------
+                
+                # ---- 6. Detailed logging with reward breakdown ----------------
                 obs_tensor = torch.from_numpy(obs.reshape(1, -1).astype(np.float32))
                 q_vals = rl_selector.agent.q_net(obs_tensor).detach().numpy()[0]
+                
+                # Get reward breakdown for logging
+                reward_breakdown = rl_selector.env.reward_calculator.get_reward_breakdown(
+                    action=action,
+                    meta_features=rl_selector._prepare_observation(mfeat),
+                    bohb_accuracy=float(acc),
+                    time_taken=eval_time,
+                    iteration=iteration,
+                    remaining_budget=remaining_budget
+                )
 
                 self.results['detailed_logs'].append({
                     "fold": prefix or "final",
@@ -427,6 +454,8 @@ class AutoMLPipeline:
                     "model_type": model_type,
                     "q_values": q_vals.tolist(),
                     "reward": reward,
+                    "enhanced_reward": enhanced_reward,
+                    "reward_breakdown": reward_breakdown,
                     "reward_components": info["reward_components"],
                     "bohb": {
                         "best_score": float(acc),
@@ -436,19 +465,22 @@ class AutoMLPipeline:
                                                 .get("convergence_history", [])[-10:],
                         "n_trials": bohb_cfg.n_trials,
                         "runtime_s": bohb_info.get("total_time", None),
-                        }
+                        "eval_time": eval_time,
+                    }
                 })
 
-
-                # bookkeeping ----------------------------------------------------
+                # ---- 7. Bookkeeping --------------------------------------------
                 iteration_perf += acc
                 evals.append({
                     "dataset": dname,
                     "model": model_type,
                     "acc": acc,
                     "reward": reward,
+                    "enhanced_reward": enhanced_reward,
                     "best_cfg": best_cfg,
+                    "eval_time": eval_time,
                 })
+                
                 self.results['bohb_evaluations'].append({
                     "iteration": iteration,
                     "dataset": dname,
@@ -457,8 +489,9 @@ class AutoMLPipeline:
                     "best_config": best_cfg,
                     "timestamp": time.time(),
                     "cv_fold": prefix or 'final',
+                    "eval_time": eval_time,
+                    "remaining_budget": remaining_budget,
                 })
-
 
             # ---- iteration summary --------------------------------------------
             mean_acc = iteration_perf / len(evals)
@@ -467,25 +500,27 @@ class AutoMLPipeline:
                 "avg_performance": mean_acc,
                 "evaluation_results": evals,
                 "cv_fold": prefix or 'final',
+                "remaining_budget": remaining_budget,
             })
-            self._log_progress(f"{log_prefix}ITER_DONE",
-                            f"iter  {iteration}: meanacc {mean_acc:.4f}")
+            self._log_progress(f"{log_prefix}ITER_DONE", f"iter {iteration}: meanacc {mean_acc:.4f}")
 
             self.results['performance_history'].append({
-                    'iteration': iteration,
-                    'performance': mean_acc,
-                    'timestamp': time.time(),
-                    'cv_fold': prefix or 'final'
-                })
-            # simple convergence check
+                'iteration': iteration,
+                'performance': mean_acc,
+                'timestamp': time.time(),
+                'cv_fold': prefix or 'final',
+                'remaining_budget': remaining_budget,
+            })
+            
+            # Simple convergence check
             if iteration > 1 and \
             abs(self.results['rl_training_iterations'][-1]['avg_performance']
                 - self.results['rl_training_iterations'][-2]['avg_performance']) < 0.005:
+                self._log_progress(f"{log_prefix}CONVERGENCE", f"Converged at iteration {iteration}")
                 break
 
         self._log_progress(f"{log_prefix}TRAINING", "RL-BOHB finished")
         return rl_selector
-
     def run_leave_one_out_cv(self):
         """Run leave-one-out cross-validation.
         
@@ -605,6 +640,7 @@ class AutoMLPipeline:
                 f"(±{self.results['cv_results']['summary']['std_score']:.4f})"
             )
 
+
     def _run_final_training(self, dataset: str = "yelp") -> Dict[str, Any]:
         """Run final training on all datasets."""
         # Prepare all training datasets for final training
@@ -617,11 +653,12 @@ class AutoMLPipeline:
         )
 
         final_selection: Dict[str, Any] = {}
-        # load meta‐features and data of exam data
+        
+        # Load meta‐features and data of exam data
         meta_feats = self._extract_meta_features_from_test(dataset)
         texts, labels = load_dataset(dataset, split='train')
 
-        # call select_model_with_bohb to get both tier and its best config
+        # Call select_model_with_bohb to get both tier and its best config
         model_type, action, info = self.final_rl_selector.select_model_with_bohb(
             meta_features=meta_feats,
             training_data=(texts, labels),
@@ -635,13 +672,16 @@ class AutoMLPipeline:
             )
         )
 
+        best_cfg = info.get('bohb_info', {}).get('best_config', {})
+        best_score = info.get('bohb_info', {}).get('best_score', None)
+
         # For plotting purposes for the 4th visualization function
-        inc_history = info.get("bohb_info", {}).get("incumbent_history")
+        inc_history = info.get("bohb_info", {}).get("optimization_stats", {}).get("convergence_history", [])
         if inc_history:
             self.results["detailed_logs"].append({
                 "fold": "final",
                 "iteration": 0,
-                "dataset": dataset,                 # "yelp"
+                "dataset": dataset,
                 "action": action,
                 "model_type": model_type,
                 "q_values": info.get("q_values", []),
@@ -655,60 +695,58 @@ class AutoMLPipeline:
                     "runtime_s": info.get("bohb_info", {}).get("total_time"),
                 },
             })
-        best_cfg = info.get('bohb_info', {}).get('best_config', {})
-        best_score = info.get('bohb_info', {}).get('best_score', None)
 
-        # log & store
+        # Log & store
         self._log_progress(
             "FINAL_SELECTION",
             f"{dataset}: {model_type} @ acc≈{best_score:.4f}",
             {"best_config": best_cfg}
         )
+        
         final_selection[dataset] = {
-            "model_type":   model_type,
-            "best_config":  best_cfg,
-            "bohb_score":   best_score,
-            "confidence":   info.get("confidence"),
-            "q_values":     info.get("q_values"),
+            "model_type": model_type,
+            "best_config": best_cfg,
+            "bohb_score": best_score,
+            "confidence": info.get("confidence"),
+            "q_values": info.get("q_values"),
         }
 
-        # save into results
+        # Save into results
         self.results['final_selections'] = final_selection
         self.results["final_mean_performance"] = best_score
         return final_selection
+        def _predict_on_test_split(self, dataset: str = "yelp", data_path: str = "data") -> np.ndarray:
+            """predict test split."""
+            if dataset not in self.results.get('final_selections', {}):
+                raise RuntimeError(f"No final selection found for dataset '{dataset}'. Did you run _run_final_training()?")
 
-    def _predict_on_test_split(self, dataset: str = "yelp", data_path: str = "data") -> np.ndarray:
-        """predict test split."""
-        if dataset not in self.results.get('final_selections', {}):
-            raise RuntimeError(f"No final selection found for dataset '{dataset}'. Did you run _run_final_training()?")
+            # Extract best model info
+            model_info = self.results['final_selections'][dataset]
+            model_type = model_info['model_type']
+            best_config = model_info['best_config']
+            self._log_progress(f"Predicting on {dataset} using {model_type} with config: {best_config}")
+            print(best_config)
+            # Load train + test splits
+            df_train = pd.read_csv(Path(data_path) / dataset /"train.csv")
+            df_test = pd.read_csv(Path(data_path) / dataset /"test.csv")
+            texts_train = df_train["text"].tolist()
+            labels_train = df_train["label"].tolist()
+            texts_test = df_test["text"].tolist()
 
-        # Extract best model info
-        model_info = self.results['final_selections'][dataset]
-        model_type = model_info['model_type']
-        best_config = model_info['best_config']
-        self._log_progress(f"Predicting on {dataset} using {model_type} with config: {best_config}")
-        print(best_config)
-        # Load train + test splits
-        df_train = pd.read_csv(Path(data_path) / dataset /"train.csv")
-        df_test = pd.read_csv(Path(data_path) / dataset /"test.csv")
-        texts_train = df_train["text"].tolist()
-        labels_train = df_train["label"].tolist()
-        texts_test = df_test["text"].tolist()
+            # Test using best config
+            # THIS PART SHOULD BE CHANGED BECAUSE I WAS NOT SURE ABOUT THE MODEL STRUCTURES
+            if model_type == "simple":
+                preds = self._predict_simple(best_config, texts_train, labels_train, texts_test)
 
-        # Test using best config
-        # THIS PART SHOULD BE CHANGED BECAUSE I WAS NOT SURE ABOUT THE MODEL STRUCTURES
-        if model_type == "simple":
-            preds = self._predict_simple(best_config, texts_train, labels_train, texts_test)
+            elif model_type == "medium":
+                preds = self._predict_medium(best_config, texts_train, labels_train, texts_test)
 
-        elif model_type == "medium":
-            preds = self._predict_medium(best_config, texts_train, labels_train, texts_test)
+            elif model_type == "complex":
+                preds = self._predict_complex(best_config, texts_train, labels_train, texts_test)
 
-        elif model_type == "complex":
-            preds = self._predict_complex(best_config, texts_train, labels_train, texts_test)
-
-        else:
-            raise ValueError(f"Unknown model type: {model_type}")
-        return np.asarray(preds, dtype=int)
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
+            return np.asarray(preds, dtype=int)
 
     def _predict_simple(self, cfg, Xtr, ytr, Xte):
         from sklearn.feature_extraction.text import TfidfVectorizer

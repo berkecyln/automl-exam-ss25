@@ -22,7 +22,7 @@ from .rl_agent import (
     ModelSelectionEnv,
     RLModelSelector,
 )
-
+from .reward_calculation import AutoMLRewardCalculator
 
 __all__ = [
     'TextAutoML',
@@ -39,5 +39,6 @@ __all__ = [
     'LoggedStage',
     'ModelSelectionEnv',
     'RLModelSelector',
+    'AutoMLRewardCalculator',
 ]
 # end of file

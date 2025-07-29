@@ -22,3 +22,5 @@ experiments/
 
 smac3_output/
 .DS_Store
+automl/rl_agent.py
+automl_pipeline_results/
