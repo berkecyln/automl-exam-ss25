@@ -495,87 +495,39 @@ class RLModelSelector:
         deterministic: bool = True,
         bohb_config: Optional[Any] = None,
     ) -> Tuple[str, int, Dict[str, Any]]:
-        """Select model with BOHB-enhanced reward evaluation.
-
-        Args:
-            meta_features: Normalized meta-features from dataset
-            training_data: (texts, labels) for BOHB evaluation
-            fidelity_mode: "low" or "high" fidelity BOHB optimization
-            deterministic: Whether to use deterministic policy
-            bohb_config: Optional custom BOHB configuration
-
-        Returns:
-            Tuple of (model_type, action, decision_info)
-        """
-        if training_data is None:
-            logger.warning("No training data provided for BOHB evaluation")
+        """Select model with BOHB-enhanced evaluation, only on the top RL action."""
+        # fall back to policy-only if no BOHB data
+        if training_data is None or not self.is_trained or self.agent is None:
             return self.select_model(meta_features, deterministic)
-            
-        if not self.is_trained:
-            logger.warning("RL agent not trained for BOHB evaluation")
-            return "medium", 1, {"method": "default", "reason": "agent_not_trained"}
 
-        # Prepare observation
+        # prepare obs + Q-values
         obs = self._prepare_observation(meta_features)
-
-        if self.agent is None:
-            logger.warning("RL agent is None")
-            return "medium", 1, {"method": "default", "reason": "agent_is_none"}
-
-        # Get Q-values for all actions
         obs_tensor = torch.from_numpy(obs.reshape(1, -1).astype(np.float32))
         q_values = self.agent.q_net(obs_tensor).detach().numpy()[0]
 
-        # Evaluate top actions with BOHB
-        top_actions = np.argsort(q_values)[::-1]  # Sort in descending order
-
-        best_action = None
-        best_reward = -np.inf
-        best_info = {}
-
-        # Evaluate top 2-3 actions with BOHB (limited for efficiency)
-        max_evaluations = min(2, len(top_actions))
-
-        for i in range(max_evaluations):
-            action = top_actions[i]
-
-            # Use environment's BOHB evaluation
-            reward, optimization_info = self.env.evaluate_with_bohb(
-                action=action,
-                meta_features=obs,
-                training_data=training_data,
-                fidelity_mode=fidelity_mode,
-                bohb_config=bohb_config,
-            )
-
-            if self.logger:
-                self.logger.log_debug(
-                    f"BOHB evaluation: action={action}, reward={reward:.4f}, "
-                    f"method={optimization_info.get('method', 'unknown')}"
-                )
-
-            if reward > best_reward:
-                best_reward = reward
-                best_action = action
-                best_info = optimization_info
-
-        # Select best action
-        if best_action is None:
-            best_action = top_actions[0]  # Fall back to highest Q-value
-
+        # pick best RL action
+        best_action = int(np.argmax(q_values))
         model_type = self.action_to_model[best_action]
+
+        # run BOHB once on that action
+        reward, bohb_info = self.env.evaluate_with_bohb(
+            action=best_action,
+            meta_features=obs,
+            training_data=training_data,
+            fidelity_mode=fidelity_mode,
+            bohb_config=bohb_config,
+        )
 
         decision_info = {
             "action": best_action,
             "model_type": model_type,
-            "confidence": float(best_reward),
+            "confidence": float(reward),
             "q_values": q_values.tolist(),
-            "bohb_info": best_info,
-            "fidelity_mode": fidelity_mode,
+            "bohb_info": bohb_info,
             "method": "rl_with_bohb",
         }
-
         return model_type, best_action, decision_info
+
 
     def save_model(self, path: Optional[Path] = None) -> Path:
         """Save trained RL model."""

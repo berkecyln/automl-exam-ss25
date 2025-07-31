@@ -65,16 +65,22 @@ class AutoMLPipeline:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # base BOHB configuration
-        self.bohb_base = BOHBConfig(max_budget=100, min_budget=10, n_trials=25, wall_clock_limit=720)
+        self.bohb_base = BOHBConfig(max_budget=30, min_budget=10, n_trials=10, wall_clock_limit=300)
         # Maximum iterations for RL training
         self.max_iterations = max_iterations
 
         # Available datasets
         # (Phase 1) Training datasets
-        self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
+        #self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
+        self.datasets = ['amazon', 'ag_news']
         # (Phase 2) Exam dataset 
         self.exam_dataset = "yelp"
-        
+        # cv agents dictionary
+        self.cv_agent_paths: Dict[str, Path] = {}
+        # Create models directory
+        models_dir = self.output_dir / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+
         # Setup logging
         self.logger = AutoMLLogger(
             experiment_name=f"automl_pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -292,12 +298,12 @@ class AutoMLPipeline:
 
         if iteration <= explore_cutoff:
             # cheap exploration: few trials, short timeout
-            cfg.n_trials = min(8, max(5, cfg.n_trials // 4))
-            cfg.wall_clock_limit = max(120, base_wall * 0.3)
+            cfg.n_trials = min(3, max(5, cfg.n_trials // 4))
+            cfg.wall_clock_limit = max(60, base_wall * 0.3)
         else:
             # heavier exploitation
-            cfg.n_trials = min(30, cfg.n_trials)
-            cfg.wall_clock_limit = min(600, base_wall * 1.0)
+            cfg.n_trials = min(15, cfg.n_trials)
+            cfg.wall_clock_limit = min(300, base_wall * 1.0)
 
         
         return cfg
@@ -471,6 +477,8 @@ class AutoMLPipeline:
                 break
 
         self._log_progress(f"{log_prefix}TRAINING", "RL-BOHB finished")
+        rl_selector.save_model()
+
         return rl_selector
 
     def run_leave_one_out_cv(self):
@@ -506,6 +514,9 @@ class AutoMLPipeline:
                 training_datasets, 
                 prefix=f"cv_{held_out}"
             )
+            
+            # Save the agent path for this fold
+            self.cv_agent_paths[held_out] = rl_selector.model_save_path
             
             # Evaluate on held-out dataset
             held_out_meta_features = self.results['meta_features'][held_out]
@@ -587,16 +598,8 @@ class AutoMLPipeline:
 
     def _run_final_training(self, is_test: bool = True) -> Dict[str, Any]:
         """Run final training on all datasets."""
-        # Prepare all training datasets for final training
-        training_datasets = self._prepare_training_datasets()
         test_dataset = self.exam_dataset
         
-        # Run RL+BOHB training on all datasets
-        self.final_rl_selector = self._run_iterative_rl_bohb_training(
-            training_datasets, 
-            prefix="final"
-        )
-
         final_selection: Dict[str, Any] = {}
         # load meta‐features and data of exam data
         meta_feats = self._extract_meta_features(is_test=is_test)
@@ -610,67 +613,108 @@ class AutoMLPipeline:
             model_type= "TEST",
             is_test=is_test
         )
-        # call select_model_with_bohb to get both tier and its best config
-        model_type, action, info = self.final_rl_selector.select_model_with_bohb(
-            meta_features=meta_feats,
-            training_data=(texts, labels),
-            fidelity_mode="high",
-            deterministic=True,
-            bohb_config=bohb_final_cfg
-        )
+        
+        if not self.cv_agent_paths:
+            raise RuntimeError("No CV agents found; cannot do final selection")
 
-        # For plotting purposes for the 4th visualization function
-        inc_history = info.get("bohb_info", {}).get("incumbent_history")
-        best_cfg = info.get('bohb_info', {}).get('best_config', {})
-        best_score = info.get('bohb_info', {}).get('best_score', None)
-        if inc_history:
-            self.results["detailed_logs"].append({
-                "fold": "final",
-                "iteration": 0,
-                "dataset": test_dataset,                 # "yelp"
-                "action": action,
-                "model_type": model_type,
-                "q_values": info.get("q_values", []),
-                "reward": best_score,
-                "reward_components": {},
-                "bohb": {
-                    "best_score": best_score,
-                    "best_config": best_cfg,
-                    "incumbent_history": inc_history,
-                    "n_trials": len(inc_history),
-                    "runtime_s": info.get("bohb_info", {}).get("total_time"),
-                },
-            })
+        # Loop over each CV agent
+        for held_out, agent_path in self.cv_agent_paths.items():
+            # Instantiate a new RLModelSelector pointing at agent_path
+            rl_selector = RLModelSelector(
+                meta_features_dim=META_FEATURE_DIM,
+                model_save_path=agent_path,
+                logger=self.logger,
+                random_state=42,
+            )
+            
+            # Load the trained model
+            rl_selector.load_model()
+            
+            # call select_model_with_bohb to get both tier and its best config
+            model_type, action, info = rl_selector.select_model_with_bohb(
+                meta_features=meta_feats,
+                training_data=(texts, labels),
+                fidelity_mode="high",
+                deterministic=True,
+                bohb_config=bohb_final_cfg
+            )
 
-        # log & store
-        self._log_progress(
-            "FINAL_SELECTION",
-            f"{test_dataset}: {model_type} @ acc≈{best_score:.4f}",
-            {"best_config": best_cfg}
-        )
-        final_selection[test_dataset] = {
-            "model_type":   model_type,
-            "best_config":  best_cfg,
-            "bohb_score":   best_score,
-            "confidence":   info.get("confidence"),
-            "q_values":     info.get("q_values"),
-        }
+            # Extract information from the returned info
+            best_cfg = info.get('bohb_info', {}).get('best_config', {})
+            best_score = info.get('bohb_info', {}).get('best_score', None)
+            confidence = info.get("confidence")
+            q_values = info.get("q_values")
+            
+            # For plotting purposes for the 4th visualization function
+            inc_history = info.get("bohb_info", {}).get("incumbent_history")
+            if inc_history:
+                self.results["detailed_logs"].append({
+                    "fold": held_out,
+                    "iteration": 0,
+                    "dataset": test_dataset,                 # "yelp"
+                    "action": action,
+                    "model_type": model_type,
+                    "q_values": q_values or [],
+                    "reward": best_score,
+                    "reward_components": {},
+                    "bohb": {
+                        "best_score": best_score,
+                        "best_config": best_cfg,
+                        "incumbent_history": inc_history,
+                        "n_trials": len(inc_history),
+                        "runtime_s": info.get("bohb_info", {}).get("total_time"),
+                    },
+                })
+
+            # log & store
+            self._log_progress(
+                "FINAL_SELECTION",
+                f"{held_out} agent on {test_dataset}: {model_type} @ acc≈{best_score:.4f}",
+                {"best_config": best_cfg}
+            )
+            
+            final_selection[held_out] = {
+                "model_type":   model_type,
+                "best_config":  best_cfg,
+                "bohb_score":   best_score,
+                "confidence":   confidence,
+                "q_values":     q_values,
+            }
 
         # save into results
         self.results['final_selections'] = final_selection
-        self.results["final_mean_performance"] = best_score
+        
+        # Calculate final mean performance as the mean of all BOHB scores
+        if final_selection:
+            all_scores = [sel["bohb_score"] for sel in final_selection.values() if sel["bohb_score"] is not None]
+            self.results["final_mean_performance"] = np.mean(all_scores) if all_scores else 0.0
+        else:
+            self.results["final_mean_performance"] = 0.0
+            
         return final_selection
 
     def _predict_on_test_split(self, dataset: str = "yelp", data_path: str = "data") -> np.ndarray:
         """predict test split."""
-        if dataset not in self.results.get('final_selections', {}):
-            raise RuntimeError(f"No final selection found for dataset '{dataset}'. Did you run _run_final_training()?")
+        final_selections = self.results.get('final_selections', {})
+        if not final_selections:
+            raise RuntimeError(f"No final selections found. Did you run _run_final_training()?")
+
+        # Choose the best performing agent for prediction
+        best_agent = None
+        best_score = -1
+        for agent_name, model_info in final_selections.items():
+            if model_info['bohb_score'] is not None and model_info['bohb_score'] > best_score:
+                best_score = model_info['bohb_score']
+                best_agent = agent_name
+
+        if best_agent is None:
+            raise RuntimeError(f"No valid agent found for prediction")
 
         # Extract best model info
-        model_info = self.results['final_selections'][dataset]
+        model_info = final_selections[best_agent]
         model_type = model_info['model_type']
         best_config = model_info['best_config']
-        self._log_progress("PREDICT:", f"Predicting on {dataset} using {model_type} with config: {best_config}")
+        self._log_progress("PREDICT:", f"Predicting on {dataset} using {model_type} from agent {best_agent} with config: {best_config}")
         print(best_config)
         # Load train + test splits
         df_train = pd.read_csv(Path(data_path) / dataset /"train.csv")
@@ -763,10 +807,12 @@ def main():
     print(f"Folds: {len(results['cv_results']['folds'])}")
     print(f"Mean CV accuracy: {results['cv_results']['summary'].get('mean_score', 0):.4f}")
     print("Per-dataset CV scores:")
-    for ds, sc in results['cv_results']['performance'].items():
-        print(f"  {ds}: {sc:.4f}")
-    print(f"Final model performance: {results.get('final_mean_performance', 0):.4f}")
-    print(f"\nResults saved to: {args.output}")
+    for fold in results['cv_results']['folds']:
+       held = fold['held_out']
+       model = fold['selected_model']
+       score = fold['bohb_score']
+       print(f"  Held-out {held}: selected model = {model}, score = {score:.4f}")
+    print(f"\nResults saved to: {output_dir}")
     print("\n======================================================================")
     print("FINAL TRAIN AND PREDICT COMPLETED")
     print("======================================================================")
@@ -774,8 +820,8 @@ def main():
     # Display final model selection results
     final_selections = results.get('final_selections', {})
     if final_selections:
-        for dataset, selection in final_selections.items():
-            print(f"📊 Final Model Selection for {dataset.upper()}:")
+        for agent_name, selection in final_selections.items():
+            print(f"📊 Final Model Selection from {agent_name.upper()} Agent:")
             print(f"   • Selected Model: {selection['model_type'].title()}")
             print(f"   • BOHB Score: {selection['bohb_score']:.4f}")
             print(f"   • Confidence: {selection.get('confidence', 0):.4f}")
