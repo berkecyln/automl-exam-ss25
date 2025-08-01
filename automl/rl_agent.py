@@ -6,7 +6,7 @@ the most appropriate model type (Simple/Medium/Complex) given dataset characteri
 """
 
 from __future__ import annotations
-from curses import meta
+#from curses import meta
 from math import sqrt
 
 import numpy as np

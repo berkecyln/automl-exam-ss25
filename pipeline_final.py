@@ -28,7 +28,8 @@ from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 import torch
 import argparse
-
+from lime.lime_text import LimeTextExplainer
+import random
 from automl.meta_features import MetaFeatureExtractor
 from automl.rl_agent import RLModelSelector
 from automl.datasets import load_dataset
@@ -374,7 +375,8 @@ class AutoMLPipeline:
                 bohb_cfg = self.make_bohb_profile(iteration, max_iterations, self.bohb_base, model_type=model_type, is_test=False)
                 bo = BOHBOptimizer(model_type=model_type,
                                 random_state=42,
-                                config=bohb_cfg)
+                                config=bohb_cfg,
+                                logger=self.logger,)
                 
                 best_cfg, acc, bohb_info = bo.optimize(
                     X_train=texts,
@@ -537,7 +539,8 @@ class AutoMLPipeline:
             bohb_optimizer = BOHBOptimizer(
                 model_type=model_type,
                 random_state=42,
-                config=final_cfg
+                config=final_cfg,
+                logger= self.logger
             )
             
             # Sample for BOHB evaluation
@@ -554,7 +557,17 @@ class AutoMLPipeline:
                 y_train=sampled_labels,
                 fidelity_mode="high"  # Use high fidelity for better results
             )
-            
+            fanova_imp = bohb_info.get("fanova_top5", [])
+            if fanova_imp:
+                self._log_progress(
+                    "CV_FANOVA",
+                    f"{held_out}: top HP importances {fanova_imp}"
+                )
+            else:
+                self._log_progress(
+                    "CV_FANOVA",
+                    "no fanova importances available"
+                )
             fold_time = time.time() - fold_start_time
             
             # Record CV results
@@ -605,6 +618,19 @@ class AutoMLPipeline:
         meta_feats = self._extract_meta_features(is_test=is_test)
         texts, labels = load_dataset(test_dataset, split='train')
 
+
+        extractor = MetaFeatureExtractor()
+        ranking  = extractor.get_feature_importance_ranking(meta_feats)
+        top_k = 5
+        self._log_progress(
+            "INTERP_META",
+            f"Top-{top_k} meta-features influencing RL choice"    
+        )
+
+        self._log_progress(
+            "INTERP_META_DETAILS",
+            {f: meta_feats[f] for f in ranking[:top_k]},
+        )
         # Force exploit mode for final selection
         bohb_final_cfg = self.make_bohb_profile(
             iteration=self.max_iterations + 1,
@@ -647,24 +673,30 @@ class AutoMLPipeline:
             
             # For plotting purposes for the 4th visualization function
             inc_history = info.get("bohb_info", {}).get("incumbent_history")
+            fanova_imp = info.get("bohb_info", {}).get("fanova_top5", [])
+            if fanova_imp:
+                self._log_progress(
+                    "FINAL_FANOVA",
+                    f"Top hyper-parameter importances (share of variance): {fanova_imp}"
+                )
             if inc_history:
-                self.results["detailed_logs"].append({
-                    "fold": held_out,
-                    "iteration": 0,
-                    "dataset": test_dataset,                 # "yelp"
-                    "action": action,
-                    "model_type": model_type,
-                    "q_values": q_values or [],
-                    "reward": best_score,
-                    "reward_components": {},
-                    "bohb": {
-                        "best_score": best_score,
-                        "best_config": best_cfg,
-                        "incumbent_history": inc_history,
-                        "n_trials": len(inc_history),
-                        "runtime_s": info.get("bohb_info", {}).get("total_time"),
-                    },
-                })
+                    self.results["detailed_logs"].append({
+                        "fold": held_out,
+                        "iteration": 0,
+                        "dataset": test_dataset,                 # "yelp"
+                        "action": action,
+                        "model_type": model_type,
+                        "q_values": q_values or [],
+                        "reward": best_score,
+                        "reward_components": {},
+                        "bohb": {
+                            "best_score": best_score,
+                            "best_config": best_cfg,
+                            "incumbent_history": inc_history,
+                            "n_trials": len(inc_history),
+                            "runtime_s": info.get("bohb_info", {}).get("total_time"),
+                        },
+                    })
 
             # log & store
             self._log_progress(
@@ -738,6 +770,42 @@ class AutoMLPipeline:
             # Predict on test data
             preds = model.predict(texts_test)
             
+
+            try:
+                explainer = LimeTextExplainer(class_names=[str(c) for c in sorted(set(labels_train))])
+                
+                # pick a few examples to explain (3 random test texts)
+                sample_idx = random.sample(range(len(texts_test)), k=min(3, len(texts_test)))
+                explanations = []
+
+                for idx in sample_idx:
+                    exp = explainer.explain_instance(
+                        texts_test[idx],
+                        model.predict_proba,
+                        num_features=5,
+                        labels=[preds[idx]]
+                    )
+                    # store the explanation as list of (word, weight) tuples
+                    explanations.append({
+                        "index": idx,
+                        "pred_label": int(preds[idx]),
+                        "top_words": exp.as_list(label=preds[idx])
+                    })
+
+                # log & stash for later inspection
+                self._log_progress(
+                    "LIME",
+                    f"Generated LIME explanations for {len(explanations)} test instances",
+                )
+                self._log_progress("LIME_DETAILS",
+                    f"Explanations: {explanations}")
+                # keep them in results so you can inspect/save later
+                self.results.setdefault("lime_explanations", []) \
+                            .extend(explanations)
+
+            except Exception as e:
+                # don’t crash the pipeline if LIME fails
+                self._log_progress("LIME_ERROR", f"LIME explanation failed: {e}")
         except Exception as e:
             self._log_progress("PREDICT_ERROR", f"Failed to predict with {model_type}: {e}")
             raise
@@ -801,11 +869,13 @@ def main():
     pipeline.run_pipeline()
     results = pipeline.results
 
+    
+        
     print("\n======================================================================")
     print("LEAVE-ONE-OUT CV COMPLETED")
     print("======================================================================")
     print(f"Folds: {len(results['cv_results']['folds'])}")
-    print(f"Mean CV accuracy: {results['cv_results']['summary'].get('mean_score', 0):.4f}")
+    #print(f"Mean CV accuracy: {results['cv_results']['summary'].get('mean_score', 0):.4f}")
     print("Per-dataset CV scores:")
     for fold in results['cv_results']['folds']:
        held = fold['held_out']

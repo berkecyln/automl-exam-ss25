@@ -6,13 +6,15 @@ provide feedback for model selection decisions.
 """
 
 from __future__ import annotations
+from datetime import datetime
+from pathlib import Path
 
 
 import numpy as np
 from typing import Dict, Any, Tuple, Optional, List
 import time
 from dataclasses import dataclass
-
+from fanova import fANOVA 
 # SMAC3 imports
 from ConfigSpace import Configuration, ConfigurationSpace
 from ConfigSpace.hyperparameters import (
@@ -35,6 +37,9 @@ from sklearn.model_selection import train_test_split
 # Local imports
 from .logging_utils import AutoMLLogger
 from .models import create_model
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
+import pandas as pd
 
 
 @dataclass
@@ -123,6 +128,39 @@ class BOHBOptimizer:
         # Performance tracking
         self.evaluation_count = 0
         self.total_time = 0.0
+
+    def estimate_hyperparameter_importance(self) -> List[Tuple[str, float]]:
+        if len(self.optimization_history) < 5:
+            print("⚠️ Not enough history for hyperparameter importance")
+            return []
+
+        try:
+            # Extract config and scores
+            configs = [run["config"] for run in self.optimization_history]
+            scores = [run["score"] for run in self.optimization_history]
+
+            # Convert to DataFrame
+            df = pd.DataFrame(configs)
+
+            # Encode categorical hyperparameters
+            df_encoded = pd.get_dummies(df)
+
+            # Fit Random Forest to predict score from hyperparameters
+            rf = RandomForestRegressor(n_estimators=100, random_state=self.random_state)
+            rf.fit(df_encoded, scores)
+
+            # Permutation importance
+            result = permutation_importance(rf, df_encoded, scores, n_repeats=5, random_state=self.random_state)
+
+            importances = [(df_encoded.columns[i], result.importances_mean[i])
+                        for i in range(len(result.importances_mean))]
+            importances = sorted(importances, key=lambda x: x[1], reverse=True)[:5]
+
+            print("🌲 Hyperparameter importances (surrogate model):", importances)
+            return importances
+        except Exception as e:
+            print(f"⚠️ Hyperparameter importance estimation failed: {e}")
+            return []
 
     def _calculate_budget(self, fidelity_mode: str) -> Dict[str, float]:
         """Calculate budget parameters based on fidelity mode.
@@ -386,8 +424,7 @@ class BOHBOptimizer:
         # Store training data
         self.X_train = X_train
         self.y_train = y_train
-
-        # Create validation split if not provided
+        
         if X_val is None or y_val is None:
             self.X_train, self.X_val, self.y_train, self.y_val = train_test_split(
                 X_train,
@@ -515,6 +552,72 @@ class BOHBOptimizer:
         self.best_score = best_score
         self.best_config = best_config  # Make sure this is set from SMAC's incumbent
 
+        from sklearn.inspection import permutation_importance
+
+        fanova_top5 = []
+        try:
+            fanova_top5 = self.estimate_hyperparameter_importance()
+            print("🌲 Top-5 hyperparameter importances (fANOVA):", fanova_top5)
+            self.logger.logger.info(
+                f"Top-5 hyperparameter importances from fANOVA: {fanova_top5}",
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to FANOVA estimate hyperparameter importance: {e}")
+            if self.logger:
+                self.logger.log_debug("Hyperparameter importance FANOVA estimation failed", {"error": str(e)})
+
+        try:
+            if self.best_config is not None and len(self.optimization_history) >= 5:
+                print("🔍 Running permutation importance for top-5 hyperparameters...")
+
+                # Recreate model with best config
+                model = create_model(
+                    model_type=self.model_type,
+                    config=self.best_config,
+                    random_state=self.random_state,
+                    budget_fraction=0.2 # Full budget for final model
+                )
+
+                # Fit on full train data
+                model.fit(self.X_train, self.y_train)
+
+                # Ensure the validation data is transformed properly
+                if hasattr(model, "vectorizer"):
+                    X_val_vec = model.vectorizer.transform(self.X_val)
+                    if hasattr(model, "preprocessor") and model.preprocessor:
+                        X_val_vec = model.preprocessor.transform(X_val_vec)
+                    if hasattr(X_val_vec, "toarray"):
+                        X_val_dense = X_val_vec.toarray()
+                    else:
+                        X_val_dense = X_val_vec
+                else:
+                    raise ValueError("Model has no vectorizer for transformation")
+
+                # Run permutation importance
+                try:
+                    
+                    result = permutation_importance(
+                        model.model, X_val_dense, self.y_val, n_repeats=1, random_state=0, n_jobs=-1
+                    )
+                    importances = result.importances_mean
+                    top_indices = np.argsort(importances)[-5:][::-1]
+                    top_features = [
+                        model.vectorizer.get_feature_names_out()[i] for i in top_indices
+                    ]
+                    print("Top 5 important features:", top_features)
+                    self.logger.logger.info(
+                        f"Top 5 important features from permutation importance: {top_features}",
+                    )
+                except Exception as e:
+                    print("⚠️ Permutation importance failed:", e)
+
+                print("✅ Top-5 important hyperparameters:", top_features)
+
+        except Exception as e:
+            print(f"⚠️ Permutation importance failed: {e}")
+            if self.logger:
+                self.logger.log_debug("Permutation importance skipped/failed", {"reason": str(e)})
+
         optimization_stats = {
             "total_time": optimization_time,
             "evaluation_time": self.total_time,
@@ -526,6 +629,7 @@ class BOHBOptimizer:
             ],  # Last 10 evaluations
             "improvement_over_default": best_score
             - 0.5,  # Assuming 0.5 random baseline
+            "fanova_top5": fanova_top5,
         }
 
         if self.logger:

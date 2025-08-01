@@ -17,6 +17,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import Normalizer
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score
+from scipy.special import softmax
 
 
 class BaseTextModel:
@@ -41,7 +42,13 @@ class BaseTextModel:
         predictions = self.predict(X_val)
         return accuracy_score(y_val, predictions)
 
-
+    def predict_proba(self, X_test: List[str]) -> np.ndarray:            # <-- add
+        """
+        Default fallback – subclasses must override if they can’t give
+        probabilities.  LIME needs this method.
+        """
+        raise NotImplementedError("predict_proba not implemented for this model")
+    
 class SimpleModel(BaseTextModel):
     """Simple model: TF-IDF + LogisticRegression/SVM"""
     
@@ -57,6 +64,7 @@ class SimpleModel(BaseTextModel):
             max_df=self.config["max_df"],
             ngram_range=(1, self.config["ngram_max"]),
             stop_words="english",
+            token_pattern=r"(?u)\b[a-zA-Z]{2,}\b"
         )
         
         # Transform training data
@@ -86,6 +94,23 @@ class SimpleModel(BaseTextModel):
         X_test_vec = self.vectorizer.transform(X_test)
         return self.model.predict(X_test_vec)
 
+    def predict_proba(self, X_test: List[str]) -> np.ndarray:            # NEW
+        if self.vectorizer is None or self.model is None:
+            raise ValueError("Model must be fitted before prediction")
+        X_test_vec = self.vectorizer.transform(X_test)
+
+        if hasattr(self.model, "predict_proba"):
+            return self.model.predict_proba(X_test_vec)
+
+        # e.g. Linear-kernel SVC – approximate from margins
+        if hasattr(self.model, "decision_function"):
+            scores = self.model.decision_function(X_test_vec)
+            
+            if scores.ndim == 1:                 # binary -> two columns
+                scores = np.vstack([-scores, scores]).T
+            return softmax(scores, axis=1)
+
+        raise AttributeError("Underlying classifier lacks probability output")
 
 class MediumModel(BaseTextModel):
     """Medium model: TF-IDF + TruncatedSVD + LogisticRegression"""
@@ -99,7 +124,8 @@ class MediumModel(BaseTextModel):
         self.vectorizer = TfidfVectorizer(
             max_features=self.config["max_features"],
             stop_words="english",
-            ngram_range=(1, 2)
+            ngram_range=(1, 2),
+            token_pattern=r"(?u)\b[a-zA-Z]{2,}\b"
         )
         
         # Transform training data
@@ -135,6 +161,26 @@ class MediumModel(BaseTextModel):
         X_test_svd = self.preprocessor.transform(X_test_tfidf)
         return self.model.predict(X_test_svd)
 
+    def predict_proba(self, X_test: List[str]) -> np.ndarray:            # NEW
+        if self.vectorizer is None or self.preprocessor is None or self.model is None:
+            raise ValueError("Model must be fitted before prediction")
+
+        X_test_svd = self.preprocessor.transform(
+            self.vectorizer.transform(X_test)
+        )
+
+        if hasattr(self.model, "predict_proba"):
+            return self.model.predict_proba(X_test_svd)
+
+        if hasattr(self.model, "decision_function"):
+            scores = self.model.decision_function(X_test_svd)
+            if scores.ndim == 1:
+                scores = np.vstack([-scores, scores]).T
+            return softmax(scores, axis=1)
+
+        raise AttributeError("Underlying classifier lacks probability output")
+    
+
 
 class ComplexModel(BaseTextModel):
     """Complex model: TF-IDF + MLPClassifier"""
@@ -149,7 +195,8 @@ class ComplexModel(BaseTextModel):
         self.vectorizer = TfidfVectorizer(
             max_features=self.config["max_features"],
             stop_words=None,  # Include stopwords for richer representation
-            ngram_range=(1, 3)  # Include trigrams
+            ngram_range=(1, 3),  # Include trigrams,
+            token_pattern=r"(?u)\b[a-zA-Z]{2,}\b"
         )
         
         # Transform training data
@@ -182,6 +229,11 @@ class ComplexModel(BaseTextModel):
         X_test_vec = self.vectorizer.transform(X_test)
         return self.model.predict(X_test_vec)
 
+    def predict_proba(self, X_test: List[str]) -> np.ndarray:            # NEW
+        if self.vectorizer is None or self.model is None:
+            raise ValueError("Model must be fitted before prediction")
+        X_test_vec = self.vectorizer.transform(X_test)
+        return self.model.predict_proba(X_test_vec)      # MLPClassifier has it
 
 # Factory function to create models
 def create_model(model_type: str, config: Dict[str, Any], random_state: int = 42, **kwargs) -> BaseTextModel:

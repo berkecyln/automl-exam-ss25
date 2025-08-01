@@ -69,7 +69,7 @@ def run_pipeline(args):
     pipeline = AutoMLPipeline(
         max_runtime_hours=args.time,
         output_dir=output_dir,
-        num_iterations=args.max_iterations,
+        max_iterations=args.max_iterations,
     )
     
     start_time = time.time()
