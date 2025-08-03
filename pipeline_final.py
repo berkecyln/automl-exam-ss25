@@ -72,8 +72,8 @@ class AutoMLPipeline:
 
         # Available datasets
         # (Phase 1) Training datasets
-        #self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
-        self.datasets = ['amazon', 'ag_news']
+        self.datasets = ['amazon', 'ag_news', 'dbpedia', 'imdb']
+        #self.datasets = ['amazon', 'ag_news']
         # (Phase 2) Exam dataset 
         self.exam_dataset = "yelp"
         # cv agents dictionary
@@ -158,9 +158,17 @@ class AutoMLPipeline:
             prediction_file = output_path / "predictions.npy"
             np.save(prediction_file, predicted_labels)
             print(f"Saved predictions to {prediction_file}")
+            
+            # Save final results for visualization
+            final_results_path = self.output_dir / "final_results.pkl"
+            with open(final_results_path, 'wb') as f:
+                pickle.dump(self.results, f)
+            self._log_progress("SAVE_RESULTS", f"Final results saved to {final_results_path}")
+            print(f"📊 Final results saved to: {final_results_path}")
 
             self._log_progress("COMPLETION", "Full pipeline completed successfully")
 
+            return self.results
 
         except Exception as e:
             self._log_progress("CRITICAL_ERROR", f"Pipeline failed: {e}")
