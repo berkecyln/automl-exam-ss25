@@ -410,7 +410,7 @@ class AutoMLPipeline:
                 )
                 bo = BOHBOptimizer(
                     model_type=model_type,
-                    random_state=42,
+                    random_state=self.random_state,
                     config=bohb_cfg,
                     logger=self.logger,
                 )
