@@ -50,9 +50,9 @@ class AutoMLVisualizer:
         print("🎨 Creating AutoML Pipeline Visualizations...")
         print(f"📁 Output directory: {self.output_dir}")     
         self.create_bohb_timeline()     
-        #self.create_meta_feature_radar_chart()
+        self.create_meta_feature_radar_chart()
         self.create_expert_committee_dashboard()
-        #self.create_bohb_optimization_progress()      
+        self.create_bohb_optimization_progress()      
         print("✅ All visualizations completed!")
 
     def create_bohb_timeline(self):
@@ -909,7 +909,7 @@ class AutoMLVisualizer:
                 gradient_ax = fig.add_axes([0.93, 0.55, 0.02, 0.3])  # Higher position (0.55-0.85)
                 gradient = np.linspace(0, 1, 256).reshape(256, 1)
                 
-                gradient_ax.imshow(gradient, aspect='auto', cmap=budget_colormap)
+                gradient_ax.imshow(gradient, aspect='auto', cmap=budget_colormap.reversed())
                 gradient_ax.set_xticks([])
                 gradient_ax.set_yticks([])
                 
