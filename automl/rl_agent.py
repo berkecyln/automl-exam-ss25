@@ -6,9 +6,8 @@ the most appropriate model type (Simple/Medium/Complex) given dataset characteri
 """
 
 from __future__ import annotations
-#from curses import meta
-from math import sqrt
 
+from math import sqrt
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -18,11 +17,10 @@ from pathlib import Path
 import pickle
 import torch
 import time
-
 from stable_baselines3 import DQN
 
 # Import constants for feature consistency across the system
-from .constants import FEATURE_ORDER, META_FEATURE_DIM, MODEL_TYPES
+from .constants import FEATURE_ORDER, MODEL_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +83,7 @@ class ModelSelectionEnv(gym.Env):
             1: "Medium",
             2: "Complex",
         }
-        
+
         # Create mapping from action index to model type
         self.action_to_model = {i: model_type for i, model_type in enumerate(MODEL_TYPES)}
 
@@ -114,7 +112,6 @@ class ModelSelectionEnv(gym.Env):
         else:
             # SB3 internal reset -> give a harmless dummy vector
             feats = np.zeros(self.meta_features_dim, dtype=np.float32)
-                # or feats = self._generate_synthetic_meta_features()
 
         # pad/truncate
         if len(feats) < self.meta_features_dim:
@@ -133,7 +130,9 @@ class ModelSelectionEnv(gym.Env):
             reward = 0.0
         else:
             # Calculate reward based on action and current meta-features
-            reward = self._calculate_enhanced_reward(action, self.current_meta_features, bohb_accuracy=self.bohb_accuracy)
+            reward = self._calculate_enhanced_reward(
+                action, self.current_meta_features, bohb_accuracy=self.bohb_accuracy
+            )
 
         # Episode terminates after one decision
         terminated = True
@@ -142,9 +141,7 @@ class ModelSelectionEnv(gym.Env):
         info = {
             "action_name": self.action_names[action],
             "meta_features": self.current_meta_features.copy(),
-            "reward_components": self._get_reward_components(
-                action, self.current_meta_features
-            ),
+            "reward_components": self._get_reward_components(action, self.current_meta_features),
         }
 
         return (
@@ -156,17 +153,17 @@ class ModelSelectionEnv(gym.Env):
         )
 
     def _calculate_enhanced_reward(
-            self,
-            action: int,
-            meta_features: np.ndarray,
-            bohb_accuracy: Optional[float] = None,
-        ) -> float:
+        self,
+        action: int,
+        meta_features: np.ndarray,
+        bohb_accuracy: Optional[float] = None,
+    ) -> float:
         """
-        Calculate reward using BOHB accuracy and meta-features. 
+        Calculate reward using BOHB accuracy and meta-features.
 
         reward = w1 * normalized_accuracy
             - w2 * model_complexity_penalty
-            + w3 * conf_gap 
+            + w3 * conf_gap
             + w4 * richness
 
         Requires: bohb_accuracy is not None.
@@ -174,7 +171,7 @@ class ModelSelectionEnv(gym.Env):
         if bohb_accuracy is None:
             raise ValueError("bohb_accuracy must be provided for reward calculation")
         if isinstance(meta_features, np.ndarray):
-            mf = { name: float(val) for name, val in zip(FEATURE_ORDER, meta_features) }
+            mf = {name: float(val) for name, val in zip(FEATURE_ORDER, meta_features)}
         else:
             mf = meta_features
 
@@ -184,7 +181,7 @@ class ModelSelectionEnv(gym.Env):
         w3 = 0.15  # Conditional gap weight
         w4 = 0.15  # Feature richness weight
 
-        # 1. Normalized BOHB accuracy 
+        # 1. Normalized BOHB accuracy
         normalized_accuracy = min(1.0, max(0.0, float(bohb_accuracy)))
 
         # 2. Model complexity penalty
@@ -198,31 +195,30 @@ class ModelSelectionEnv(gym.Env):
         # 3) baseline‐confidence gap
         # Using default baseline in meta features we encourage the agent to
         # chose medium or complex models if dataset has poor baseline and high variance
-        baseline = mf['baseline_accuracy']
-        baseline_std = mf['baseline_accuracy_std']
+        baseline = mf["baseline_accuracy"]
+        baseline_std = mf["baseline_accuracy_std"]
         conf_gap = (1 - baseline) * baseline_std
-        #  we are dividing by size since we want to normalize the gap so 
-        # it scales down on large datasets (where noise averages out) 
+        #  we are dividing by size since we want to normalize the gap so
+        # it scales down on large datasets (where noise averages out)
         # and stays meaningful on small ones (where noise really matters)
-        conf_gap = conf_gap / sqrt(mf['dataset_size'])
+        conf_gap = conf_gap / sqrt(mf["dataset_size"])
 
         # 4) feature richness
         # Using type-token ratio and word length standard deviation
         # If we have high type-token ratio this means we have a lot of new words so medium or complex models might be better
-        ttr = mf['type_token_ratio']
+        ttr = mf["type_token_ratio"]
         # If we have high hapax legomena ratio this means we have a lot of rare words so medium or complex models might be better
-        hapax = mf['hapax_legomena_ratio']
+        hapax = mf["hapax_legomena_ratio"]
         alpha = 0.5  # Equal weighting
-        richness = (alpha * ttr + (1 - alpha) * hapax)
+        richness = alpha * ttr + (1 - alpha) * hapax
 
         # Final reward
         reward = (
-            w1 * normalized_accuracy
-            - w2 * model_complexity_penalty
-            + w3 * conf_gap 
-            + w4 * richness
+            w1 * normalized_accuracy - w2 * model_complexity_penalty + w3 * conf_gap + w4 * richness
         )
-        print(f"Reward: {w1} * bohb accuracy({normalized_accuracy}) - {w2} * model complexity({model_complexity_penalty}) + {w3} * confidence gap({conf_gap}) + {w4} * richness({richness})")
+        print(
+            f"Reward: {w1} * bohb accuracy({normalized_accuracy}) - {w2} * model complexity({model_complexity_penalty}) + {w3} * confidence gap({conf_gap}) + {w4} * richness({richness})"
+        )
 
         # Clamp as before
         reward = np.clip(reward, -1.0, 1.0)
@@ -291,9 +287,7 @@ class ModelSelectionEnv(gym.Env):
             logger.warning(f"BOHB evaluation failed: {e}")
             return 0.0, {"method": "failed", "error": str(e)}
 
-    def _get_reward_components(
-        self, action: int, meta_features: np.ndarray
-    ) -> Dict[str, float]:
+    def _get_reward_components(self, action: int, meta_features: np.ndarray) -> Dict[str, float]:
         """Get detailed breakdown of reward components for logging."""
         baseline_acc = meta_features[0] if len(meta_features) > 0 else 0.5
         dataset_size = meta_features[1] if len(meta_features) > 1 else 0.5
@@ -334,16 +328,12 @@ class RLModelSelector:
             random_state: Random seed
         """
         self.meta_features_dim = meta_features_dim
-        self.model_save_path = (
-            Path(model_save_path) if model_save_path else Path("models/rl_agent")
-        )
+        self.model_save_path = Path(model_save_path) if model_save_path else Path("models/rl_agent")
         self.logger = logger
         self.random_state = random_state
 
         # Create environment
-        self.env = ModelSelectionEnv(
-            meta_features_dim=meta_features_dim, random_state=random_state
-        )
+        self.env = ModelSelectionEnv(meta_features_dim=meta_features_dim, random_state=random_state)
 
         # RL agent
         self.agent = None
@@ -397,9 +387,7 @@ class RLModelSelector:
             exploration_final_eps=0.05,
             max_grad_norm=10,
             tensorboard_log=(
-                str(self.model_save_path.parent / "tensorboard")
-                if self.logger
-                else None
+                str(self.model_save_path.parent / "tensorboard") if self.logger else None
             ),
             policy_kwargs=dict(net_arch=[64, 64]),
             verbose=0,
@@ -410,9 +398,7 @@ class RLModelSelector:
         callback = None  # Skip callback for now to avoid compatibility issues
 
         # Train the agent
-        self.agent.learn(
-            total_timesteps=total_timesteps, callback=callback, progress_bar=False
-        )
+        self.agent.learn(total_timesteps=total_timesteps, callback=callback, progress_bar=False)
 
         training_time = time.time() - start_time
         self.is_trained = True
@@ -527,7 +513,6 @@ class RLModelSelector:
             "method": "rl_with_bohb",
         }
         return model_type, best_action, decision_info
-
 
     def save_model(self, path: Optional[Path] = None) -> Path:
         """Save trained RL model."""

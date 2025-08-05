@@ -6,15 +6,11 @@ provide feedback for model selection decisions.
 """
 
 from __future__ import annotations
-from datetime import datetime
-from pathlib import Path
-
-
 import numpy as np
 from typing import Dict, Any, Tuple, Optional, List
 import time
 from dataclasses import dataclass
-from fanova import fANOVA 
+
 # SMAC3 imports
 from ConfigSpace import Configuration, ConfigurationSpace
 from ConfigSpace.hyperparameters import (
@@ -28,10 +24,6 @@ from smac.facade.blackbox_facade import BlackBoxFacade
 from smac.intensifier.hyperband import Hyperband
 
 # ML imports
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 
 # Local imports
@@ -45,23 +37,24 @@ import pandas as pd
 @dataclass
 class BOHBConfig:
     """Configuration for BOHB optimization.
-    
+
     Handles budget parameters for Bayesian Optimization with HyperBand.
-    
+
     Parameters:
         min_budget: Minimum fidelity (e.g., dataset percentage)
         max_budget: Maximum fidelity (e.g., full dataset)
         n_trials: Total configurations to evaluate (must be > max_budget)
         wall_clock_limit: Maximum runtime in seconds
     """
+
     # Budget parameters
     max_budget: float = 100.0
     min_budget: float = 10.0
     n_trials: int = 150
-    
+
     # Time constraint
     wall_clock_limit: float = 600.0  # 10 minutes default
-    
+
     # SMAC parameters
     n_workers: int = 1
     seed: int = 42
@@ -82,7 +75,6 @@ class BOHBConfig:
             self.n_trials = int(self.max_budget * 1.5)
         if self.wall_clock_limit <= 0:
             self.wall_clock_limit = 600.0
-            
 
 
 class BOHBOptimizer:
@@ -105,13 +97,13 @@ class BOHBOptimizer:
         """
         self.model_type = model_type.lower()
         self.logger = logger
-        
+
         # Create a config with adjusted settings for this model type
         if config is None:
             self.config = BOHBConfig()
         else:
             self.config = config
-            
+
         self.random_state = random_state
 
         # Training data placeholders
@@ -131,7 +123,7 @@ class BOHBOptimizer:
 
     def estimate_hyperparameter_importance(self) -> List[Tuple[str, float]]:
         if len(self.optimization_history) < 5:
-            print("⚠️ Not enough history for hyperparameter importance")
+            print("Not enough history for hyperparameter importance")
             return []
 
         try:
@@ -150,61 +142,65 @@ class BOHBOptimizer:
             rf.fit(df_encoded, scores)
 
             # Permutation importance
-            result = permutation_importance(rf, df_encoded, scores, n_repeats=5, random_state=self.random_state)
+            result = permutation_importance(
+                rf, df_encoded, scores, n_repeats=5, random_state=self.random_state
+            )
 
-            importances = [(df_encoded.columns[i], result.importances_mean[i])
-                        for i in range(len(result.importances_mean))]
+            importances = [
+                (df_encoded.columns[i], result.importances_mean[i])
+                for i in range(len(result.importances_mean))
+            ]
             importances = sorted(importances, key=lambda x: x[1], reverse=True)[:5]
 
-            print("🌲 Hyperparameter importances (surrogate model):", importances)
+            print("Hyperparameter importances (surrogate model):", importances)
             return importances
         except Exception as e:
-            print(f"⚠️ Hyperparameter importance estimation failed: {e}")
+            print(f"Hyperparameter importance estimation failed: {e}")
             return []
 
     def _calculate_budget(self, fidelity_mode: str) -> Dict[str, float]:
         """Calculate budget parameters based on fidelity mode.
-        
+
         Args:
             fidelity_mode: "low" or "high" fidelity optimization
-            
+
         Returns:
             Dictionary with budget parameters
         """
         # Start with base parameters
         min_budget = self.config.min_budget
-        
+
         # Adjust max_budget based on fidelity mode
         if fidelity_mode == "high":
             max_budget = self.config.max_budget
         else:
             # For low fidelity, reduce the max budget
             max_budget = max(min_budget * 1.5, self.config.max_budget * 0.3)
-            
+
         # Adjust n_trials based on fidelity mode
         n_trials = (
-            self.config.n_trials if fidelity_mode == "high" 
-            else min(self.config.n_trials // 2, 10)
+            self.config.n_trials if fidelity_mode == "high" else min(self.config.n_trials // 2, 10)
         )
-        
+
         # Adjust time limit based on fidelity mode
         time_limit = (
-            self.config.wall_clock_limit if fidelity_mode == "high"
+            self.config.wall_clock_limit
+            if fidelity_mode == "high"
             else self.config.wall_clock_limit * 0.5
         )
-        
+
         # Ensure parameters meet SMAC requirements
         if max_budget <= min_budget:
             max_budget = min_budget * 3.0
-            
+
         if n_trials <= max_budget:
             n_trials = int(max_budget * 1.5)
-            
+
         return {
             "min_budget": min_budget,
             "max_budget": max_budget,
             "n_trials": n_trials,
-            "time_limit": time_limit
+            "time_limit": time_limit,
         }
 
     def _create_config_space(self) -> ConfigurationSpace:
@@ -252,14 +248,9 @@ class BOHBOptimizer:
         self.evaluation_count += 1
 
         # Simple timeout check - if we're past our timeout, stop the optimization
-        if (
-            hasattr(self, "optimization_timeout")
-            and time.time() > self.optimization_timeout
-        ):
+        if hasattr(self, "optimization_timeout") and time.time() > self.optimization_timeout:
             if self.evaluation_count % 3 == 0:  # Only log occasionally to avoid spam
-                print(
-                    f"Stopping BOHB evaluation #{self.evaluation_count} due to timeout"
-                )
+                print(f"Stopping BOHB evaluation #{self.evaluation_count} due to timeout")
             return float("inf")  # Return bad score to stop optimization
 
         # Log progress every few evaluations to track progress without spam
@@ -298,7 +289,9 @@ class BOHBOptimizer:
             elif self.model_type == "medium":
                 score = self._evaluate_model(config, X_train_sample, y_train_sample)
             else:  # complex
-                score = self._evaluate_model(config, X_train_sample, y_train_sample, budget_fraction)
+                score = self._evaluate_model(
+                    config, X_train_sample, y_train_sample, budget_fraction
+                )
 
             # Track evaluation time
             eval_time = time.time() - start_time
@@ -309,15 +302,9 @@ class BOHBOptimizer:
                 try:
                     # Convert SMAC Configuration to dictionary
                     hyperparams_dict = (
-                        dict(config)
-                        if hasattr(config, "__iter__")
-                        else config.get_dictionary()
+                        dict(config) if hasattr(config, "__iter__") else config.get_dictionary()
                     )
-                    fid = (
-                        f"budget_{raw_budget:.0f}"
-                        if raw_budget is not None
-                        else "budget_full"
-                    )
+                    fid = f"budget_{raw_budget:.0f}" if raw_budget is not None else "budget_full"
 
                     self.logger.log_bohb_iteration(
                         iteration=self.evaluation_count,
@@ -363,33 +350,33 @@ class BOHBOptimizer:
             return float("inf")  # Indicate failure without fallback
 
     def _evaluate_model(
-        self, 
-        config: Configuration, 
-        X_train: List[str], 
+        self,
+        config: Configuration,
+        X_train: List[str],
         y_train: List[int],
-        budget_fraction: float = 1.0
+        budget_fraction: float = 1.0,
     ) -> float:
         """Unified model evaluation using the model classes from models.py"""
         try:
             # Convert configuration to dictionary
             config_dict = dict(config)
-            
+
             # Create model using the factory function
             model = create_model(
                 model_type=self.model_type,
                 config=config_dict,
                 random_state=self.random_state,
-                budget_fraction=budget_fraction
+                budget_fraction=budget_fraction,
             )
-            
+
             # Train the model
             model.fit(X_train, y_train)
-            
+
             # Evaluate on validation set
             score = model.evaluate(self.X_val, self.y_val)
-            
+
             return score
-            
+
         except Exception as e:
             if self.logger:
                 self.logger.log_error(f"{self.model_type.title()} model evaluation failed: {e}")
@@ -424,7 +411,7 @@ class BOHBOptimizer:
         # Store training data
         self.X_train = X_train
         self.y_train = y_train
-        
+
         if X_val is None or y_val is None:
             self.X_train, self.X_val, self.y_train, self.y_val = train_test_split(
                 X_train,
@@ -439,13 +426,13 @@ class BOHBOptimizer:
 
         # Calculate budget parameters based on fidelity mode
         budget_config = self._calculate_budget(fidelity_mode)
-        
+
         # Extract the budget values
         min_budget = budget_config["min_budget"]
         max_budget = budget_config["max_budget"]
         n_trials = budget_config["n_trials"]
         actual_time_limit = budget_config["time_limit"]
-        
+
         # Set SMAC time limit to be slightly less than our actual limit
         smac_time_limit = actual_time_limit * 0.9  # 90% of our actual time limit
 
@@ -459,7 +446,7 @@ class BOHBOptimizer:
         scenario = Scenario(
             configspace=config_space,
             deterministic=self.config.deterministic,
-            n_trials=int(n_trials),  # Ensure n_trials is an integer
+            n_trials=int(n_trials),
             seed=self.config.seed,
             walltime_limit=smac_time_limit,
             min_budget=float(min_budget),
@@ -473,10 +460,7 @@ class BOHBOptimizer:
             incumbent_selection="highest_budget",  # optional but good
         )
 
-        # TODO: Check if we really need budget as input
-        def target_fn(
-            config: Configuration, seed: int | None = None, budget: float | None = None
-        ):
+        def target_fn(config: Configuration, seed: int | None = None, budget: float | None = None):
             # Store the budget so _evaluate_config can read it
             self.current_budget = budget
             try:
@@ -494,7 +478,7 @@ class BOHBOptimizer:
 
         if self.logger:
             self.logger.logger.info(
-                f"🔧 Starting BOHB optimization: {self.model_type} model, "
+                f"Starting BOHB optimization: {self.model_type} model, "
                 f"fidelity={fidelity_mode}, trials={n_trials}, time_limit={actual_time_limit}s"
             )
 
@@ -503,7 +487,6 @@ class BOHBOptimizer:
 
         # Run optimization with time monitoring
         try:
-            # Track the start time to calculate actual elapsed time
             optimization_start_time = time.time()
 
             try:
@@ -529,8 +512,7 @@ class BOHBOptimizer:
             # Get incumbent if available
             incumbent = (
                 smac.intensifier.get_incumbent()
-                if hasattr(smac, "intensifier")
-                and smac.intensifier.get_incumbent() is not None
+                if hasattr(smac, "intensifier") and smac.intensifier.get_incumbent() is not None
                 else None
             )
 
@@ -544,79 +526,26 @@ class BOHBOptimizer:
             best_score = -neg_cost  # back to accuracy
         else:
             best_config = dict(config_space.get_default_configuration())
-            best_score = max(
-                (h["score"] for h in self.optimization_history), default=0.0
-            )
+            best_score = max((h["score"] for h in self.optimization_history), default=0.0)
 
         # Update both best_score and best_config to ensure consistency
         self.best_score = best_score
         self.best_config = best_config  # Make sure this is set from SMAC's incumbent
 
-        from sklearn.inspection import permutation_importance
-
         fanova_top5 = []
         try:
             fanova_top5 = self.estimate_hyperparameter_importance()
-            print("🌲 Top-5 hyperparameter importances (fANOVA):", fanova_top5)
+            print("Top-5 hyperparameter importances (fANOVA):", fanova_top5)
             self.logger.logger.info(
                 f"Top-5 hyperparameter importances from fANOVA: {fanova_top5}",
             )
         except Exception as e:
-            print(f"⚠️ Failed to FANOVA estimate hyperparameter importance: {e}")
+            print(f"Failed to FANOVA estimate hyperparameter importance: {e}")
             if self.logger:
-                self.logger.log_debug("Hyperparameter importance FANOVA estimation failed", {"error": str(e)})
-
-        try:
-            if self.best_config is not None and len(self.optimization_history) >= 5:
-                print("🔍 Running permutation importance for top-5 hyperparameters...")
-
-                # Recreate model with best config
-                model = create_model(
-                    model_type=self.model_type,
-                    config=self.best_config,
-                    random_state=self.random_state,
-                    budget_fraction=0.2 # Full budget for final model
+                self.logger.log_debug(
+                    "Hyperparameter importance FANOVA estimation failed",
+                    {"error": str(e)},
                 )
-
-                # Fit on full train data
-                model.fit(self.X_train, self.y_train)
-
-                # Ensure the validation data is transformed properly
-                if hasattr(model, "vectorizer"):
-                    X_val_vec = model.vectorizer.transform(self.X_val)
-                    if hasattr(model, "preprocessor") and model.preprocessor:
-                        X_val_vec = model.preprocessor.transform(X_val_vec)
-                    if hasattr(X_val_vec, "toarray"):
-                        X_val_dense = X_val_vec.toarray()
-                    else:
-                        X_val_dense = X_val_vec
-                else:
-                    raise ValueError("Model has no vectorizer for transformation")
-
-                # Run permutation importance
-                try:
-                    
-                    result = permutation_importance(
-                        model.model, X_val_dense, self.y_val, n_repeats=1, random_state=0, n_jobs=-1
-                    )
-                    importances = result.importances_mean
-                    top_indices = np.argsort(importances)[-5:][::-1]
-                    top_features = [
-                        model.vectorizer.get_feature_names_out()[i] for i in top_indices
-                    ]
-                    print("Top 5 important features:", top_features)
-                    self.logger.logger.info(
-                        f"Top 5 important features from permutation importance: {top_features}",
-                    )
-                except Exception as e:
-                    print("⚠️ Permutation importance failed:", e)
-
-                print("✅ Top-5 important hyperparameters:", top_features)
-
-        except Exception as e:
-            print(f"⚠️ Permutation importance failed: {e}")
-            if self.logger:
-                self.logger.log_debug("Permutation importance skipped/failed", {"reason": str(e)})
 
         optimization_stats = {
             "total_time": optimization_time,
@@ -624,18 +553,15 @@ class BOHBOptimizer:
             "num_evaluations": self.evaluation_count,
             "fidelity_mode": fidelity_mode,
             "model_type": self.model_type,
-            "convergence_history": self.optimization_history[
-                -10:
-            ],  # Last 10 evaluations
-            "improvement_over_default": best_score
-            - 0.5,  # Assuming 0.5 random baseline
+            "convergence_history": self.optimization_history[-10:],  # Last 10 evaluations
+            "improvement_over_default": best_score - 0.5,  # Assuming 0.5 random baseline
             "fanova_top5": fanova_top5,
             "full_optimization_history": self.optimization_history,  # All trials
         }
 
         if self.logger:
             self.logger.logger.info(
-                f"✅ BOHB optimization complete: best_score={best_score:.4f}, "
+                f"BOHB optimization complete: best_score={best_score:.4f}, "
                 f"time={optimization_time:.1f}s, evaluations={self.evaluation_count}"
             )
 
