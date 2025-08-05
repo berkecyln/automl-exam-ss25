@@ -35,7 +35,7 @@ from automl.datasets import load_dataset
 from automl.logging_utils import AutoMLLogger
 from automl.bohb_optimization import BOHBOptimizer, BOHBConfig
 from automl.models import create_model
-from automl.constants import META_FEATURE_DIM
+from automl.constants import META_FEATURE_DIM, DEFAULT_RANDOM_SEED
 from automl.visualizer import save_all_figures
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,14 +49,15 @@ class AutoMLPipeline:
         max_runtime_hours: float = 1.0,
         output_dir: str = "automl_pipeline_results",
         max_iterations: int = 10,
+        random_state: int = DEFAULT_RANDOM_SEED,
     ):
         """Initialize AutoML pipeline.
 
         Args:
             max_runtime_hours: Maximum runtime in hours
             output_dir: Directory for results
-            datasets: List of datasets to use (default: ['amazon', 'ag_news', 'dbpedia', 'imdb'])
             max_iterations: Maximum iterations for RL training
+            random_state: Random seed for reproducibility
         """
         # Time Limit Management
         self.max_runtime_hours = max_runtime_hours
@@ -69,6 +70,8 @@ class AutoMLPipeline:
         self.bohb_base = BOHBConfig(max_budget=30, min_budget=10, n_trials=10, wall_clock_limit=300)
         # Maximum iterations for RL training
         self.max_iterations = max_iterations
+        # Random state for reproducibility
+        self.random_state = random_state
 
         # Available datasets
         # (Phase 1) Training datasets
@@ -150,15 +153,15 @@ class AutoMLPipeline:
             self.run_leave_one_out_cv()
 
             # Step 3: Run training on all datasets
-            self._log_progress("STEP_3", "Starting training on all datasets")
-            self._run_final_training(is_test=True)
+            self._log_progress("STEP_3", "Starting exam dataset testing phase")
+            self._get_final_selections(is_test=True)
 
-            # Step 4: Predict Test Labels and save results
+            # Predict Test Labels and save results
             predicted_labels = self._predict_on_test_split()
             output_path = Path("data/exam_dataset")
             output_path.mkdir(parents=True, exist_ok=True)
 
-            # Step 5: save predictions and create visualizations
+            # Step 4: save predictions and create visualizations
             prediction_file = output_path / "predictions.npy"
             np.save(prediction_file, predicted_labels)
             print(f"Saved predictions to {prediction_file}")
@@ -358,7 +361,7 @@ class AutoMLPipeline:
             meta_features_dim=META_FEATURE_DIM,
             model_save_path=self.output_dir / "models" / f"{log_prefix}rl_agent",
             logger=self.logger,
-            random_state=42,
+            random_state=self.random_state,
         )
         rl_selector.train(
             total_timesteps=1,  # minimal “bootstrap” call
@@ -523,7 +526,7 @@ class AutoMLPipeline:
                     self.results["rl_training_iterations"][-1]["avg_performance"]
                     - self.results["rl_training_iterations"][-2]["avg_performance"]
                 )
-                < 0.005
+                < 0.003
             ):
                 break
 
@@ -588,7 +591,7 @@ class AutoMLPipeline:
             )
 
             bohb_optimizer = BOHBOptimizer(
-                model_type=model_type, random_state=42, config=final_cfg, logger=self.logger
+                model_type=model_type, random_state=self.random_state, config=final_cfg, logger=self.logger
             )
 
             # Sample for BOHB evaluation
@@ -650,8 +653,8 @@ class AutoMLPipeline:
                 f"(±{self.results['cv_results']['summary']['std_score']:.4f})",
             )
 
-    def _run_final_training(self, is_test: bool = True) -> Dict[str, Any]:
-        """Run final training on all datasets."""
+    def _get_final_selections(self, is_test: bool = True) -> Dict[str, Any]:
+        """Get final model selections for all datasets."""
         test_dataset = self.exam_dataset
 
         final_selection: Dict[str, Any] = {}
@@ -687,7 +690,7 @@ class AutoMLPipeline:
                 meta_features_dim=META_FEATURE_DIM,
                 model_save_path=agent_path,
                 logger=self.logger,
-                random_state=42,
+                random_state=self.random_state,
             )
 
             # Load the trained model
@@ -766,13 +769,11 @@ class AutoMLPipeline:
         else:
             self.results["final_mean_performance"] = 0.0
 
-        return final_selection
-
     def _predict_on_test_split(self, dataset: str = "yelp", data_path: str = "data") -> np.ndarray:
         """predict test split."""
         final_selections = self.results.get("final_selections", {})
         if not final_selections:
-            raise RuntimeError(f"No final selections found. Did you run _run_final_training()?")
+            raise RuntimeError(f"No final selections found. Did you run _get_final_selections()?")
 
         # Choose the best performing agent for prediction
         best_agent = None
@@ -804,7 +805,7 @@ class AutoMLPipeline:
         # Test using best config - use unified model approach
         try:
             # Create model using the factory function from models.py
-            model = create_model(model_type=model_type, config=best_config, random_state=42)
+            model = create_model(model_type=model_type, config=best_config, random_state=self.random_state)
 
             # Train on full training data
             model.fit(texts_train, labels_train)

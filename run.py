@@ -27,7 +27,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline import AutoMLPipeline
-from automl.constants import FEATURE_ORDER
+from automl.constants import FEATURE_ORDER, DEFAULT_RANDOM_SEED
 
 
 def setup_environment():
@@ -74,6 +74,7 @@ def run_pipeline(args):
         max_runtime_hours=args.time,
         output_dir=output_dir,
         max_iterations=args.max_iterations,
+        random_state=args.random_state,
     )
 
     start_time = time.time()
@@ -93,6 +94,7 @@ def run_pipeline(args):
     # Display cross-validation results
     print("CROSS-VALIDATION RESULTS:")
     print("----------------------------------------------------------------------")
+    mean_performance = 0
     for dataset, score in sorted(
         pipeline.results["cv_results"]["performance"].items(), key=lambda x: x[1], reverse=True
     ):
@@ -105,8 +107,9 @@ def run_pipeline(args):
             None,
         )
         print(f"  {dataset}: {score:.4f} (model: {cv_model})")
+        mean_performance += score
 
-    print(f"  MEAN: {results['cv_mean_performance']:.4f}")
+    print(f"  MEAN: {mean_performance / len(pipeline.results['cv_results']['performance']):.4f}")
     print()
 
     # Display final model selections
@@ -114,7 +117,7 @@ def run_pipeline(args):
     final_selections = results.get("final_selections", {})
     if final_selections:
         for agent_name, selection in final_selections.items():
-            print(f"📊 Final Model Selection from {agent_name.upper()} Agent:")
+            print(f"Final Model Selection from {agent_name.upper()} Agent:")
             print(f"   • Selected Model: {selection['model_type'].title()}")
             print(f"   • BOHB Score: {selection['bohb_score']:.4f}")
             print(f"   • Confidence: {selection.get('confidence', 0):.4f}")
@@ -132,18 +135,18 @@ def run_pipeline(args):
                 print(f"     - Learning Rate: {config['learning_rate']:.4f}")
 
     # Display prediction summary
-    print(f"\n🎯 Prediction Results:")
-    print(f"   • Test dataset: {pipeline.exam_dataset}")
-    print(f"   • Predictions saved to: data/exam_dataset/predictions.npy")
-    print(f"   • Total runtime: {(time.time() - pipeline.start_time)/60:.1f} minutes")
+    print(f"\nPrediction Results:")
+    print(f"   Test dataset: {pipeline.exam_dataset}")
+    print(f"   Predictions saved to: data/exam_dataset/predictions.npy")
+    print(f"   Total runtime: {(time.time() - pipeline.start_time)/60:.1f} minutes")
 
     # Display training summary
     total_bohb_evals = len(
         [eval for eval in results["bohb_evaluations"] if eval["cv_fold"] == "final"]
     )
-    print(f"\n📈 Training Summary:")
-    print(f"   • RL Training Iterations: {len(results.get('rl_training_iterations', []))}")
-    print(f"   • Total BOHB Evaluations: {total_bohb_evals}")
+    print(f"\nTraining Summary:")
+    print(f"   RL Training Iterations: {len(results.get('rl_training_iterations', []))}")
+    print(f"   Total BOHB Evaluations: {total_bohb_evals}")
 
     return results
 
@@ -162,6 +165,9 @@ def main():
     )
     parser.add_argument(
         "--max_iterations", type=int, default=10, help="Number of trials for optimization"
+    )
+    parser.add_argument(
+        "--random_state", type=int, default=DEFAULT_RANDOM_SEED, help="Random seed for reproducibility"
     )
 
     args = parser.parse_args()
