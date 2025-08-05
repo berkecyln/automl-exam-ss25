@@ -27,6 +27,11 @@ from .rl_agent import (
     RLModelSelector,
 )
 
+from .visualizer import (
+    AutoMLVisualizer,
+    save_all_figures,
+)
+
 
 __all__ = [
     'TextAutoML',
@@ -45,5 +50,7 @@ __all__ = [
     'LoggedStage',
     'ModelSelectionEnv',
     'RLModelSelector',
+    'AutoMLVisualizer',
+    'save_all_figures',
 ]
 # end of file

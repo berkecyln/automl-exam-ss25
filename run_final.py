@@ -23,7 +23,6 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline_final import AutoMLPipeline
-from automl.visualizer import save_all_figures
 from automl.constants import FEATURE_ORDER
 
 def setup_environment():
@@ -76,12 +75,6 @@ def run_pipeline(args):
     results = pipeline.run_pipeline()
 
     total_time = time.time() - start_time
-    vis_dir = output_dir / "visualizations"                       # <<< NEW >>>
-    vis_dir.mkdir(parents=True, exist_ok=True)                    # <<< NEW >>>
-    try:                                                          # <<< NEW >>>
-        save_all_figures(pipeline.results, vis_dir, feature_order=FEATURE_ORDER)              # <<< NEW >>>
-    except Exception as e:                                        # <<< NEW >>>
-        print(f"⚠️  Could not create visuals: {e}")               # <<< NEW >>>
 
     # Print final summary
     print("\n======================================================================")
@@ -89,7 +82,7 @@ def run_pipeline(args):
     print("======================================================================")
     print(f"🕐 Actual runtime: {total_time/60:.1f} minutes")
     print(f"📁 Results saved to: {output_dir}")
-    print(f"📈 Visualisations stored   : {vis_dir}")              # <<< NEW >>>
+    print(f"📈 Visualizations saved to: {output_dir / 'visualizations'}") 
     print()
     
     # Print cross-validation results

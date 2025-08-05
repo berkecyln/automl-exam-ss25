@@ -630,6 +630,7 @@ class BOHBOptimizer:
             "improvement_over_default": best_score
             - 0.5,  # Assuming 0.5 random baseline
             "fanova_top5": fanova_top5,
+            "full_optimization_history": self.optimization_history,  # All trials
         }
 
         if self.logger:

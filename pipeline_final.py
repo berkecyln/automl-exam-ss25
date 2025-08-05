@@ -37,6 +37,7 @@ from automl.logging_utils import AutoMLLogger
 from automl.bohb_optimization import BOHBOptimizer, BOHBConfig
 from automl.models import create_model
 from automl.constants import META_FEATURE_DIM, FEATURE_ORDER
+from automl.visualizer import AutoMLVisualizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -166,6 +167,24 @@ class AutoMLPipeline:
             self._log_progress("SAVE_RESULTS", f"Final results saved to {final_results_path}")
             print(f"📊 Final results saved to: {final_results_path}")
 
+            vis_dir = self.output_dir / "visualizations"
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                from automl.visualizer import save_all_figures
+                self._log_progress("VISUALIZATION", "Creating visualizations...")
+                
+                save_all_figures(
+                    results=self.results, 
+                    output_dir=vis_dir,
+                )
+                
+                self._log_progress("VISUALIZATION", f"Visualizations saved to {vis_dir}")
+                print(f"📈 Visualizations saved to: {vis_dir}")
+                
+            except Exception as e:
+                self._log_progress("VISUALIZATION_ERROR", f"Failed to create visualizations: {e}")
+                print(f"⚠️  Could not create visualizations: {e}")
+            
             self._log_progress("COMPLETION", "Full pipeline completed successfully")
 
             return self.results
@@ -458,6 +477,7 @@ class AutoMLPipeline:
                     "best_config": best_cfg,
                     "timestamp": time.time(),
                     "cv_fold": prefix or 'final',
+                    "full_optimization_history": bohb_info.get("full_optimization_history", []),
                 })
 
 
