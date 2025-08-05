@@ -29,7 +29,7 @@ class AutoMLVisualizer:
     """Creates visualizations for the AutoML pipeline results."""
 
     def __init__(
-        self, results: Dict[str, Any], output_dir: Path, style: str = "paper", dpi: int = 150
+        self, results: Dict[str, Any], output_dir: Path, style: str = "paper", dpi: int = 600
     ):
         self.results = results
         self.output_dir = Path(output_dir)
@@ -472,7 +472,7 @@ class AutoMLVisualizer:
         # Save high-quality figures
         plt.savefig(
             self.output_dir / "meta_feature_radar_chart.png",
-            dpi=300,
+            dpi=600,
             bbox_inches="tight",
             facecolor="white",
             edgecolor="none",
@@ -1125,7 +1125,7 @@ def main():
         default="paper",
         help="Style of visualizations (paper or poster)",
     )
-    parser.add_argument("--dpi", type=int, default=150, help="DPI for saved images")
+    parser.add_argument("--dpi", type=int, default=600, help="DPI for saved images")
 
     args = parser.parse_args()
 
