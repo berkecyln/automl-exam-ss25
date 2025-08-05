@@ -1,6 +1,3 @@
-from .core import (
-    TextAutoML,
-)
 from .models import (
     BaseTextModel,
     SimpleModel,
