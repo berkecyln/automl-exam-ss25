@@ -157,8 +157,6 @@ def setup_automl_data(data_path: str = "data", force_download: bool = False):
     # Verify everything is in place
     if verify_data_structure(data_dir):
         print("\n Data setup completed successfully!")
-        print(f"\nYou can now run the AutoML pipeline:")
-        print(f"   python run.py --data-path {data_path}")
         return True
     else:
         print("\n Data setup failed - verification unsuccessful")
